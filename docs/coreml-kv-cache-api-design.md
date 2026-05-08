@@ -209,6 +209,8 @@ cache id は内容 hash だけに依存させず、互換性判定に必要な m
 - `bucket_id`: `S{sequence_length}_T{text_len}_R{speaker_context_len}_C{caption_len}_B{branch_layout}`
 - `state_layout_version`: packed state の schema version
 
+`num_steps` は condition cache fingerprint の必須要素にしない。実際の KV state は `num_steps` に直接依存せず、text/reference/model/bucket/CFG branch layout と、その branch layout を変える CFG settings に依存する。`num_steps=40` で作った cache は、`sequence_length`、CFG mode/scales/window、text/reference/model/bucket が互換なら `num_steps=20` の request でも再利用できる。`cfg_min_t/cfg_max_t` は denoise loop 中に必要な state layout を決めるため、branch layout compatibility の一部として扱う。
+
 ## CoreML 実装設計
 
 ### stateful model 方針
@@ -231,12 +233,16 @@ CoreML Tools の stateful model は `ct.StateType` を使い、実行時に `MLM
 
 ### 通常 input と state
 
+通常 prediction input の dtype は、P1a 初期では既存 no-state benchmark に合わせる。既存 PoC は `compute_precision=float16` でも、`x_t` / `t` / `text` / `speaker` / masks などの normal input を `np.float32 TensorType` として変換し、`14.428ms` / `rel_diff=0.0251` の baseline を得ている。stateful P1 も比較条件を崩さないため、まず `x_t` / `t` / `latent_mask_f` は `np.float32 TensorType` / `np.float32` payload を標準にする。`StateType` は fp16 のまま、`state.write_state` payload は既述の caveat に従って初期実装では `np.float32` を使う。
+
+`--io-dtype float32|float16` のような CLI flag は後続実験として許可するが、default は `float32` とする。float16 normal IO は P1a baseline ではなく、correctness / latency / placement が float32 IO で固まった後の optional experiment として扱う。
+
 CoreML denoiser step の通常 input:
 
 ```text
-x_t          fp16 [1, S_bucket, patched_latent_dim]
-t            fp16 [1] or [B_eff]、model 内部で branch 展開する
-latent_mask  fp16/bool [1, S_bucket]
+x_t            np.float32 TensorType [1, S_bucket, patched_latent_dim]
+t              np.float32 TensorType [1] or [B_eff]、model 内部で branch 展開する
+latent_mask_f  np.float32 TensorType [1, S_bucket]
 step_flags   small int/float flags: cfg_active, speaker_kv_scaled_active, alt_branch_index
 ```
 
@@ -268,6 +274,17 @@ additive_mask = (1.0 - valid_mask_state) * -10000.0
 
 これを毎 step の normal input として渡すと、40 steps で約 1.02GB の input 転送相当になり、CoreML/ANE の計算改善を潰す。`MLState` に保持し、step input は latent と scalar だけにする。
 
+### state layout と read_state risk
+
+P1 は state layout を少なくとも次の 2 案で比較できる情報を出す。P1a で両方を実装する必要はないが、benchmark output は layout B が必要か判断できるだけの evidence を持つ。
+
+- Layout A: single packed `context_k_state` / `context_v_state` / `valid_mask_state` を持ち、`context_k_state[layer]` のように layer slicing する。これは P1a の初期 baseline とする。
+- Layout B: per-layer states に分ける。例: `context_k_l00` / `context_v_l00` ... `context_k_l11` / `context_v_l11`。single packed state が poor placement や large read overhead を起こす場合の fallback とする。
+
+警告: single packed layout では cond-only でも KV が `25,559,040 bytes` あり、compiler の lowering 次第では layer ごとに単一の小さい slice を読むつもりでも、25MB+ の state read が複数個生成される可能性がある。これは `read_state` overhead と memory placement を悪化させ、context KV projection を省いた効果を相殺し得る。
+
+P1 benchmark は CoreML program / ComputePlan / MIL program のいずれかから `read_state op count`、state name 別 read count、slice/gather の placement、large read に見える op の有無を報告する。`steady_predict_ms` が遅い場合は、まず `read_state op count` と layer slicing placement を見る。
+
 ### bucketized fixed shapes
 
 CoreML / ANE では dynamic shape を広く取るより、固定 shape の bucket を事前 compile する。
@@ -291,9 +308,13 @@ mlpackage は以下で分ける。
 - speaker caption condition 有無
 - state layout version
 
-起動時に `CoreMLDenoiserBackend` が registry を読み、初回 request 前によく使う bucket を compile/load する。`compute_precision=float16` と `ct.ComputeUnit.CPU_AND_NE` を標準にし、`MLComputePlan` で `linear`, `matmul`, `softmax` が NE に乗っていることを検証する。
+起動時に `CoreMLDenoiserBackend` が registry を読み、初回 request 前によく使う bucket を compile/load する。`compute_precision=float16` と `ct.ComputeUnit.CPU_AND_NE` を標準にし、`MLComputePlan` で `operator_name` の suffix/category が `.linear`, `.matmul`, `.softmax` の op が NE に乗っていることを検証する。
+
+`CPU_AND_NE` は ANE 強制ではない。CoreML は `CPU_AND_NE` 指定でも CPU placement を選び得るため、P1 は `compute_units` の文字列だけで判断しない。normalized ComputePlan placement と measured latency の両方で stateful model を評価する。
 
 警告: 現在の real-model PoC が証明したのは no-context-kv-cache CoreML model の NE placement であり、stateful KV model の placement ではない。`read_state` や `slice_by_index` を入れた full denoiser で、再度 `MLComputePlan` を確認する必要がある。tiny `read_state` PoC は API feasibility の確認にはなるが、real-model placement の結論には使えない。
+
+P1 の ComputePlan 集計は `ios16.linear` のような exact name を hard-code しない。no-context-kv PoC は macOS13/iOS16 ops で `ios16.linear/matmul/softmax` を報告したが、planned stateful model は `ct.target.iOS18` で変換するため、`ios18.linear`、`ios18.matmul`、`ios18.softmax` などになり得る。P1 は raw `operator_name` と、suffix から normalize した category (`linear` / `matmul` / `softmax`) の両方を report する。さらに stateful 追加 op として `read_state op count` と slice/gather placement を report する。
 
 ### denoise step の流れ
 
@@ -342,6 +363,8 @@ branch 2: speaker_uncond  text_cond     speaker_zero
 - `speaker_kv_scale is None`: normal state のみ。
 - `speaker_kv_scale != None`: scaled state と normal state を両方 prepare し、`speaker_kv_min_t` を跨ぐ step で state を切り替える。
 - `speaker_kv_max_layers` は state creation 時に対象 layer の speaker slice のみ scale する。
+
+memory accounting では、scaled state と normal state が両方 resident なら `memory_bytes` に両方を含める。`T=256/R_bucket=160` の independent layout では、normal `cond1 + independent_text_speaker3` KV が `102,236,160 bytes` なので、full scaled equivalent を追加すると KV state memory は概ね `204,472,320 bytes` まで増える。speaker slice/layer だけを別 storage にできる実装なら増分は小さくできるが、CoreML model 内で安く合成できることを確認できる場合に限る。初期実装は correctness と state switching の単純さを優先し、full separate normal/scaled states を推奨する。
 
 ## 公開 HTTP Interface
 
@@ -416,10 +439,13 @@ Response `201 Created`:
     "speaker_context_len": 138,
     "speaker_dim": 768
   },
-  "memory_bytes": 0,
+  "memory_bytes": 528384,
+  "memory_bytes_estimated": true,
   "expires_at": "2026-05-08T10:30:00+08:00"
 }
 ```
+
+reference cache の `memory_bytes` は resident layer の実 dtype/device に基づく推定値であり、`ref_latent bytes + ref_mask bytes + speaker_state bytes + speaker_mask bytes` で計算する。`speaker_kv` は lazy かつ bucket-dependent なので、materialize されるまでは reference cache の memory accounting には含めない。
 
 Status codes:
 
@@ -497,6 +523,8 @@ Request:
   }
 }
 ```
+
+`num_steps` は condition cache 作成時の optional metadata / default planning input として受けられるが、binding fingerprint には入れない。cache compatibility は text/reference/model/bucket、`sequence_length`、CFG mode/scales/window、branch layout で判定する。
 
 Response `201 Created`:
 
@@ -593,7 +621,7 @@ Request:
 
 Behavior:
 
-- `cache_mode=require`: `cache_id` がない、期限切れ、または input/seconds/num_steps/CFG/bucket と一致しない場合は audio を生成せず error。
+- `cache_mode=require`: `cache_id` がない、期限切れ、または input/seconds/CFG/bucket/branch layout と一致しない場合は audio を生成せず error。`num_steps` は non-binding metadata なので、互換 cache の reuse を拒否する hard condition にはしない。
 - `cache_mode=auto`: `cache_id` が有効なら使う。なければ従来の `runtime.synthesize` 経路。
 - `cache_mode=prepare`: cache がなければ内部で condition cache を作るが、binary response の前に準備時間が入る。
 - multi-segment input の場合は `irodori.cache_ids` または `cg_...` group id を使う。単一 `cond_...` を multi-segment に流用しようとしたら `409 Conflict`。
@@ -854,10 +882,13 @@ active step は 3 branch を batch 化できるが、NE が完全に 1 branch �
 - registered torch buffers と `ct.StateType` wrapped `TensorType` は fp16 に固定する。
 - `ct.StateType` / `MLState` を使って `mlprogram` を変換する。
 - `minimum_deployment_target=ct.target.iOS18`、`compute_precision=float16`、`CPU_AND_NE`。`ct.target.macOS15` は使わない。
+- normal prediction input の `x_t` / `t` / `latent_mask_f` は既存 no-state PoC と揃え、初期実装では `np.float32 TensorType` / `np.float32` payload を使う。`--io-dtype float32|float16` は default `float32` とし、float16 IO は optional experiment に留める。
 - `state.write_state` は初期実装で `np.float32` payload を使い、fp16 state schema に対する read/predict behavior を検証する。
-- state write once, predict many の loop benchmark を作る。
-- `read_state` / `slice_by_index` を含む stateful full denoiser で `MLComputePlan` を再取得し、`linear/matmul/softmax` の NE-preferred counts を報告する。
+- state write once, predict many の loop benchmark を作り、`make_state_ms`、`write_state_ms`、`first_predict_ms`、`steady_predict_ms` を分けて報告する。100MB 級の `MLState` write は first-use latency に効く可能性があり、steady predict が per-step speed を決める。
+- state layout は single packed `context_k_state/context_v_state` with layer slicing を初期 baseline とし、per-layer `context_k_l00/context_v_l00...` layout が必要か判断できるように `read_state op count` と slicing placement を報告する。
+- `read_state` / `slice_by_index` を含む stateful full denoiser で `MLComputePlan` を再取得し、raw `operator_name` と normalized category (`linear` / `matmul` / `softmax`) ごとの NE-preferred counts を報告する。
 - P1 acceptance gate は tiny `read_state` PoC ではなく、stateful full denoiser の read/predict correctness と NE placement report とする。
+- P1 JSON は required fields として `status` と `status_reasons` を持つ。`PASS` は correctness + placement + `steady_predict_ms` が no-state threshold より速い状態、`WARN` は correctness + placement は通るが speed / first-use cost が懸念で P2/P3 は explicit go/no-go まで block、`FAIL` は conversion / correctness / write_state / placement のいずれかが失敗して stop。
 
 ### P2: reference cache manager + HTTP endpoints
 
@@ -887,8 +918,10 @@ active step は 3 branch を batch 化できるが、NE が完全に 1 branch �
 - cache metrics:
   - reference hit/miss
   - condition hit/miss
-  - state creation ms
-  - denoiser predict ms per step/mode
+  - make_state ms
+  - write_state ms
+  - first predict ms
+  - steady predict ms per step/mode
   - NE placement summary
   - evictions and memory bytes
 
@@ -903,10 +936,13 @@ active step は 3 branch を batch 化できるが、NE が完全に 1 branch �
 - stateful CoreML denoiser が PyTorch cached path と同じ branch semantics を持つ。
 - Stateful conversion は fp16 registered buffer と fp16 `ct.StateType` で成功する。
 - `state.write_state` の dtype 方針がテストで固定され、`np.float32` payload 書き込み後の `read_state` / `predict` 結果が検証されている。
+- normal prediction input は P1a baseline で `np.float32 TensorType` を使い、float16 IO は `--io-dtype float16` の optional experiment として分離されている。
 - `rel_diff` は既存 PoC の `0.0251` と同程度、初期 gate は `<= 0.03` を目安にする。
 - CoreML `predict` の normal input に per-layer KV tensor が含まれていない。
-- `MLComputePlan` は no-context-kv-cache PoC ではなく、stateful full denoiser で再確認する。`read_state` / `slice_by_index` 導入後の `linear/matmul/softmax` NE-preferred counts を記録する。
-- single conditioned cached step が `11.5-12.5ms` 付近、少なくとも no-cache CoreML `14.428ms` より速い。
+- `MLComputePlan` は no-context-kv-cache PoC ではなく、stateful full denoiser で再確認する。`read_state` / `slice_by_index` 導入後の raw `operator_name` と normalized category (`linear` / `matmul` / `softmax`) ごとの NE-preferred counts を記録する。assertion は `ios16.*` exact name ではなく `.linear` / `.matmul` / `.softmax` suffix/category に対して行う。
+- P1 benchmark は `make_state_ms`、`write_state_ms`、`first_predict_ms`、`steady_predict_ms`、`read_state op count`、slice/gather placement を個別に記録する。single packed layout が遅い場合に per-layer layout B が必要か判断できる evidence を残す。
+- P1 JSON は `status` と `status_reasons` を必須にする。`PASS` は correctness + placement + steady predict が no-state CoreML `14.428ms` より速いこと、`WARN` は correctness + placement pass だが speed / first-use cost に懸念があり P2/P3 は explicit go/no-go まで block、`FAIL` は correctness / conversion / write_state / placement fail で stop。
+- single conditioned cached step は `11.5-12.5ms` 付近を期待する。no-cache CoreML `14.428ms` より速ければ `PASS`、遅ければ correctness/placement が通っていても `WARN` とする。
 - independent CFG active step と 40-step denoiser time を実測値として記録する。
 - `/v1/audio/speech` 既存 request は拡張なしで従来通り動く。
 - `irodori.cache_mode=require` は cache miss/mismatch 時に audio を生成しない。
@@ -940,12 +976,37 @@ uv run --with 'coremltools>=8.0' python tools/coreml_real_step_benchmark.py \
   --warmup 1
 ```
 
+P1 stateful step benchmark:
+
+```bash
+uv run --with 'coremltools>=8.0' python tools/coreml_stateful_step_benchmark.py \
+  --seconds 4 \
+  --sequence-length 100 \
+  --compute-precision float16 \
+  --iterations 10 \
+  --warmup 2
+```
+
+上記は `make_state_ms`、`write_state_ms`、`first_predict_ms`、`steady_predict_ms`、raw `operator_name`、normalized category 別 NE placement を出力する。
+
 P1 追加後に必要な新規 tests:
 
 ```bash
+python -m pytest tests/test_coreml_stateful_step_helpers.py
 python -m pytest tests/test_coreml_stateful_denoiser.py
 python -m pytest tests/test_tts_cache_api.py
 ```
+
+`tests/test_coreml_stateful_step_helpers.py` は pure helper/unit tests に限定し、500M checkpoint load、CoreML conversion、`MLState` write、実機 benchmark は実行しない。最低限の test 名:
+
+- `test_compute_state_kv_bytes`
+- `test_pack_context_kv_state_preserves_text_speaker_order`
+- `test_pack_context_kv_state_rejects_speaker_overflow`
+- `test_valid_mask_state_excludes_latent_mask`
+- `test_valid_mask_state_pads_invalid_to_zero`
+- `test_normalize_compute_plan_counts_accepts_ios16_and_ios18`
+- `test_status_warns_when_steady_predict_slower_than_no_state`
+- `test_status_fails_on_rel_diff_or_missing_ne_when_required`
 
 追加すべき assertions:
 
@@ -953,6 +1014,8 @@ python -m pytest tests/test_tts_cache_api.py
 - `predict` input keys に `context_kv` が存在しない。
 - state tensors の schema が fp16 で、`valid_mask_state` が `1.0 valid / 0.0 invalid` になっている。
 - condition cache が `cond1` と CFG active layout の両方を持つ。
+- ComputePlan aggregation が raw `operator_name` を保存し、`.linear` / `.matmul` / `.softmax` suffix から normalized category を作る。`ios16.*` exact name には依存しない。
+- `num_steps` が condition cache fingerprint の hard condition ではなく、互換 cache を `num_steps=40` から `num_steps=20` に再利用できる。
 - cache mismatch で `409`。
 - expired cache で `410`。
 - memory budget 超過で `507`。
@@ -964,6 +1027,7 @@ python -m pytest tests/test_tts_cache_api.py
 - `MLState` の state write/read API は coremltools/macOS version 依存があるため、P1 で最小 reproducer を先に固める。
 - `state.write_state` の write payload dtype は直感と異なる可能性がある。PoC では `np.float16` が reject され、`np.float32` が accepted/read back float32 だったため、predict path での実効 dtype を必ず確認する。
 - tiny `read_state` PoC は state API の確認にすぎず、real-model の ANE placement を保証しない。
+- single packed state layout は compiler lowering 次第で 25MB+ の large `read_state` を layer ごとに複数生成するリスクがある。steady predict が遅い場合は、まず `read_state op count`、state slice placement、single packed から per-layer state へ分ける必要性を triage する。
 - `MLState` は同一 state の concurrent prediction が unsafe なので、HTTP 並列 request では state lease/pool が必要。
 - B_eff=3 の active CFG は single branch の 3 倍未満になる保証がない。必ず実測して bucket/model layout を調整する。
 - state memory が大きい。`T=256/R_bucket=160` の independent CFG は 1 condition chunk で `cond1 + B_eff=3` を持つと KV だけで `102,236,160 bytes` になる。
