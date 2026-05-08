@@ -15,6 +15,21 @@ ALLOWED_CONDITION_BRANCH_LAYOUTS = (
     (BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3),
 )
 
+CACHE_MODE_OFF = "off"
+CACHE_MODE_AUTO = "auto"
+CACHE_MODE_PREPARE = "prepare"
+CACHE_MODE_REQUIRE = "require"
+CACHE_MODE_REFRESH = "refresh"
+ALLOWED_SPEECH_CACHE_MODES = frozenset(
+    {
+        CACHE_MODE_OFF,
+        CACHE_MODE_AUTO,
+        CACHE_MODE_PREPARE,
+        CACHE_MODE_REQUIRE,
+        CACHE_MODE_REFRESH,
+    },
+)
+
 DEFAULT_NUM_LAYERS = 12
 DEFAULT_NUM_HEADS = 20
 DEFAULT_HEAD_DIM = 64
@@ -37,6 +52,75 @@ class CacheValidationError(ValueError):
     """Raised when cache request metadata is malformed."""
 
 
+@dataclass(frozen=True)
+class CacheAPIError:
+    status_code: int
+    payload: dict[str, object]
+
+
+def normalize_speech_cache_mode(
+    value: str | None,
+    default: str = CACHE_MODE_OFF,
+) -> str:
+    normalized_default = _normalize_speech_cache_mode_value(default, "default")
+    if value is None:
+        return normalized_default
+    return _normalize_speech_cache_mode_value(value, "cache_mode")
+
+
+def _normalize_speech_cache_mode_value(
+    value: str,
+    name: str,
+) -> str:
+    if not isinstance(value, str):
+        raise CacheValidationError(f"{name} must be a string")
+
+    normalized = value.strip().lower()
+    if normalized not in ALLOWED_SPEECH_CACHE_MODES:
+        allowed = ", ".join(sorted(ALLOWED_SPEECH_CACHE_MODES))
+        raise CacheValidationError(f"{name} must be one of: {allowed}")
+    return normalized
+
+
+def cache_exception_to_http_error(
+    exc: Exception,
+    *,
+    cache_id: str | None = None,
+    cache_mode: str | None = None,
+) -> CacheAPIError:
+    if isinstance(exc, CacheValidationError):
+        status_code = 400
+        error_type = "cache_validation_error"
+    elif isinstance(exc, CacheNotFoundError):
+        status_code = 404
+        error_type = "cache_not_found"
+    elif isinstance(exc, CacheConflictError):
+        status_code = 409
+        error_type = "cache_mismatch"
+    elif isinstance(exc, CacheExpiredError):
+        status_code = 410
+        error_type = "cache_expired"
+    else:
+        status_code = 500
+        error_type = "cache_internal_error"
+
+    error: dict[str, object] = {
+        "type": error_type,
+        "message": str(exc),
+    }
+    if cache_id is not None:
+        error["cache_id"] = cache_id
+    if cache_mode is not None:
+        error["cache_mode"] = cache_mode
+    return CacheAPIError(status_code=status_code, payload={"error": error})
+
+
+def cache_datetime_to_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return _normalise_datetime(value).isoformat().replace("+00:00", "Z")
+
+
 def _validate_positive_int(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive int")
@@ -50,6 +134,17 @@ def _validate_request_positive_int(name: str, value: int) -> None:
 def _validate_request_non_negative_int(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise CacheValidationError(f"{name} must be a non-negative int")
+
+
+def _validate_optional_request_positive_int(name: str, value: int | None) -> None:
+    if value is None:
+        return
+    _validate_request_positive_int(name, value)
+
+
+def _validate_bool(name: str, value: bool) -> None:
+    if not isinstance(value, bool):
+        raise CacheValidationError(f"{name} must be a bool")
 
 
 def _validate_non_empty_string(name: str, value: str) -> None:
@@ -77,6 +172,15 @@ def _validate_metadata(metadata: Mapping[str, object] | None) -> None:
     for key in metadata:
         if not isinstance(key, str):
             raise CacheValidationError("metadata keys must be strings")
+
+
+def _normalise_string_tuple(name: str, value: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    if not isinstance(value, tuple | list):
+        raise CacheValidationError(f"{name} must be a tuple or list")
+    normalised = tuple(value)
+    for item in normalised:
+        _validate_non_empty_string(name, item)
+    return normalised
 
 
 def _copy_metadata(metadata: Mapping[str, object] | None) -> dict[str, object]:
@@ -262,15 +366,36 @@ class ReferenceCacheRequest:
     memory_bytes: int = 0
     ttl_seconds: float | None = None
     metadata: Mapping[str, object] | None = None
+    model: str | None = None
+    ref_len: int | None = None
+    speaker_dim: int | None = None
+    memory_bytes_estimated: bool = True
+    resident_layers: tuple[str, ...] | list[str] = ("ref_latent", "speaker_state")
+    resident_buckets: tuple[str, ...] | list[str] = ()
 
     def __post_init__(self) -> None:
         _validate_non_empty_string("model_fingerprint", self.model_fingerprint)
         _validate_non_empty_string("codec_fingerprint", self.codec_fingerprint)
         _validate_non_empty_string("reference_fingerprint", self.reference_fingerprint)
+        if self.model is not None:
+            _validate_non_empty_string("model", self.model)
         _validate_request_positive_int("speaker_context_len", self.speaker_context_len)
+        _validate_optional_request_positive_int("ref_len", self.ref_len)
+        _validate_optional_request_positive_int("speaker_dim", self.speaker_dim)
         _validate_request_non_negative_int("memory_bytes", self.memory_bytes)
+        _validate_bool("memory_bytes_estimated", self.memory_bytes_estimated)
         _validate_ttl_seconds(self.ttl_seconds)
         _validate_metadata(self.metadata)
+        object.__setattr__(
+            self,
+            "resident_layers",
+            _normalise_string_tuple("resident_layers", self.resident_layers),
+        )
+        object.__setattr__(
+            self,
+            "resident_buckets",
+            _normalise_string_tuple("resident_buckets", self.resident_buckets),
+        )
 
 
 @dataclass(kw_only=True)
@@ -281,12 +406,33 @@ class ReferenceCacheHandle:
     codec_fingerprint: str
     reference_fingerprint: str
     speaker_context_len: int
+    model: str | None = None
+    ref_len: int | None = None
+    speaker_dim: int | None = None
     created_at: datetime
     expires_at: datetime | None
     memory_bytes: int
+    memory_bytes_estimated: bool = True
+    resident_layers: tuple[str, ...] = ("ref_latent", "speaker_state")
+    resident_buckets: tuple[str, ...] = ()
     metadata: dict[str, object]
     hit_count: int = 0
     last_used_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.model is not None:
+            _validate_non_empty_string("model", self.model)
+        _validate_optional_request_positive_int("ref_len", self.ref_len)
+        _validate_optional_request_positive_int("speaker_dim", self.speaker_dim)
+        _validate_bool("memory_bytes_estimated", self.memory_bytes_estimated)
+        self.resident_layers = _normalise_string_tuple(
+            "resident_layers",
+            self.resident_layers,
+        )
+        self.resident_buckets = _normalise_string_tuple(
+            "resident_buckets",
+            self.resident_buckets,
+        )
 
 
 @dataclass(frozen=True)
@@ -353,6 +499,215 @@ class CacheCreateResult:
     reused: bool
 
 
+def reference_cache_response(
+    handle_or_result: ReferenceCacheHandle | CacheCreateResult,
+    *,
+    include_reused: bool = True,
+) -> dict[str, object]:
+    if isinstance(handle_or_result, CacheCreateResult):
+        return reference_cache_create_response(
+            handle_or_result,
+            include_reused=include_reused,
+        )
+    return reference_cache_get_response(handle_or_result)
+
+
+def reference_cache_create_response(
+    result: CacheCreateResult,
+    *,
+    include_reused: bool = True,
+) -> dict[str, object]:
+    if not isinstance(result, CacheCreateResult) or not isinstance(
+        result.handle,
+        ReferenceCacheHandle,
+    ):
+        raise CacheValidationError("result must contain a reference cache handle")
+
+    handle = result.handle
+    response = _reference_cache_common_response(handle)
+    response.update(
+        {
+            "model": handle.model,
+            "layers": _reference_layers_response(handle),
+            "shapes": _reference_shapes_response(handle),
+            "memory_bytes_estimated": handle.memory_bytes_estimated,
+        },
+    )
+    if include_reused:
+        response["reused"] = result.reused
+    return response
+
+
+def reference_cache_get_response(handle: ReferenceCacheHandle) -> dict[str, object]:
+    if not isinstance(handle, ReferenceCacheHandle):
+        raise CacheValidationError("handle must be a reference cache handle")
+
+    response = _reference_cache_common_response(handle)
+    response.update(
+        {
+            "model": handle.model,
+            "shapes": _reference_shapes_response(handle),
+            "memory_bytes_estimated": handle.memory_bytes_estimated,
+            "resident_layers": list(handle.resident_layers),
+            "resident_buckets": list(handle.resident_buckets),
+        },
+    )
+    return response
+
+
+def condition_cache_response(
+    handle_or_result: ConditionCacheHandle | CacheCreateResult,
+    *,
+    include_reused: bool = True,
+) -> dict[str, object]:
+    if isinstance(handle_or_result, CacheCreateResult):
+        return condition_cache_create_response(
+            handle_or_result,
+            include_reused=include_reused,
+        )
+    return condition_cache_get_response(handle_or_result)
+
+
+def condition_cache_create_response(
+    result: CacheCreateResult,
+    *,
+    include_reused: bool = True,
+) -> dict[str, object]:
+    if not isinstance(result, CacheCreateResult) or not isinstance(
+        result.handle,
+        ConditionCacheHandle,
+    ):
+        raise CacheValidationError("result must contain a condition cache handle")
+
+    handle = result.handle
+    branch_layouts = _normalise_branch_layouts(handle.branch_layouts)
+    response: dict[str, object] = {
+        "id": handle.id,
+        "status": handle.status,
+        "reference_cache_id": handle.reference_cache_id,
+        "model_fingerprint": handle.model_fingerprint,
+        "tokenizer_fingerprint": handle.tokenizer_fingerprint,
+        "condition_fingerprint": handle.condition_fingerprint,
+        "bucket_id": handle.bucket_id,
+        "state_layout": handle.state_layout,
+        "branch_layouts": _condition_branch_layouts_response(branch_layouts),
+        "shapes": {
+            "sequence_length": handle.sequence_length,
+            "text_len": handle.text_len,
+            "speaker_context_len": handle.speaker_context_len,
+            "speaker_context_len_bucket": handle.speaker_context_len_bucket,
+            "c_ctx_bucket": handle.c_ctx_bucket,
+            "branches_active": branch_count_for_layout(branch_layouts[-1]),
+        },
+        "memory_bytes": handle.memory_bytes,
+        "expires_at": cache_datetime_to_iso(handle.expires_at),
+        "created_at": cache_datetime_to_iso(handle.created_at),
+        "last_used_at": cache_datetime_to_iso(handle.last_used_at),
+        "hit_count": handle.hit_count,
+        "metadata": _json_safe_mapping(handle.metadata),
+    }
+    if include_reused:
+        response["reused"] = result.reused
+    return response
+
+
+def condition_cache_get_response(handle: ConditionCacheHandle) -> dict[str, object]:
+    if not isinstance(handle, ConditionCacheHandle):
+        raise CacheValidationError("handle must be a condition cache handle")
+
+    branch_layouts = _normalise_branch_layouts(handle.branch_layouts)
+    response: dict[str, object] = {
+        "id": handle.id,
+        "status": handle.status,
+        "reference_cache_id": handle.reference_cache_id,
+        "bucket_id": handle.bucket_id,
+        "cfg": {
+            "mode": _condition_cfg_mode(branch_layouts),
+            "active_steps_estimate": None,
+            "branches_active": branch_count_for_layout(branch_layouts[-1]),
+        },
+        "resident_states": list(branch_layouts),
+        "created_at": cache_datetime_to_iso(handle.created_at),
+        "last_used_at": cache_datetime_to_iso(handle.last_used_at),
+        "hit_count": handle.hit_count,
+        "metadata": _json_safe_mapping(handle.metadata),
+    }
+    return response
+
+
+def cache_create_status_code(result: CacheCreateResult) -> int:
+    if not isinstance(result, CacheCreateResult):
+        raise CacheValidationError("result must be a CacheCreateResult")
+    return 200 if result.reused else 201
+
+
+def _reference_cache_common_response(handle: ReferenceCacheHandle) -> dict[str, object]:
+    return {
+        "id": handle.id,
+        "status": handle.status,
+        "model_fingerprint": handle.model_fingerprint,
+        "codec_fingerprint": handle.codec_fingerprint,
+        "reference_fingerprint": handle.reference_fingerprint,
+        "memory_bytes": handle.memory_bytes,
+        "expires_at": cache_datetime_to_iso(handle.expires_at),
+        "created_at": cache_datetime_to_iso(handle.created_at),
+        "last_used_at": cache_datetime_to_iso(handle.last_used_at),
+        "hit_count": handle.hit_count,
+        "metadata": _json_safe_mapping(handle.metadata),
+    }
+
+
+def _reference_shapes_response(handle: ReferenceCacheHandle) -> dict[str, int | None]:
+    return {
+        "ref_len": handle.ref_len,
+        "speaker_context_len": handle.speaker_context_len,
+        "speaker_dim": handle.speaker_dim,
+    }
+
+
+def _reference_layers_response(handle: ReferenceCacheHandle) -> dict[str, object]:
+    layers: dict[str, object] = dict.fromkeys(handle.resident_layers, True)
+    layers.setdefault("speaker_kv", "lazy")
+    return layers
+
+
+def _condition_branch_layouts_response(branch_layouts: tuple[str, ...]) -> dict[str, str]:
+    if branch_layouts == (BRANCH_LAYOUT_COND1,):
+        return {"cond": BRANCH_LAYOUT_COND1}
+    if branch_layouts == (BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3):
+        return {
+            "cond": BRANCH_LAYOUT_COND1,
+            "cfg_active": BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3,
+        }
+    raise CacheValidationError("branch_layouts must be a supported canonical layout tuple")
+
+
+def _condition_cfg_mode(branch_layouts: tuple[str, ...]) -> str:
+    if BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3 in branch_layouts:
+        return "independent"
+    return "cond"
+
+
+def _json_safe_mapping(metadata: Mapping[str, object]) -> dict[str, object]:
+    return {str(key): _json_safe_value(value) for key, value in metadata.items()}
+
+
+def _json_safe_value(value: object) -> object:
+    if value is None or isinstance(value, bool | str | int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return str(value)
+    if isinstance(value, datetime):
+        return cache_datetime_to_iso(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
 def _reference_cache_id(request: ReferenceCacheRequest) -> str:
     return _content_id(
         "ref",
@@ -417,9 +772,15 @@ class InMemoryCoreMLCacheManager:
             codec_fingerprint=request.codec_fingerprint,
             reference_fingerprint=request.reference_fingerprint,
             speaker_context_len=request.speaker_context_len,
+            model=request.model,
+            ref_len=request.ref_len,
+            speaker_dim=request.speaker_dim,
             created_at=now,
             expires_at=_expires_at(now, request.ttl_seconds),
             memory_bytes=request.memory_bytes,
+            memory_bytes_estimated=request.memory_bytes_estimated,
+            resident_layers=tuple(request.resident_layers),
+            resident_buckets=tuple(request.resident_buckets),
             metadata=_copy_metadata(request.metadata),
         )
         self._reference_caches[cache_id] = handle
@@ -450,6 +811,7 @@ class InMemoryCoreMLCacheManager:
             and existing is not None
             and not self._is_expired(existing, now)
         ):
+            self._record_resident_bucket(reference, existing.bucket_id)
             return CacheCreateResult(handle=existing, reused=True)
 
         branch_layouts = tuple(request.branch_layouts)
@@ -473,6 +835,7 @@ class InMemoryCoreMLCacheManager:
             metadata=_copy_metadata(request.metadata),
         )
         self._condition_caches[cache_id] = handle
+        self._record_resident_bucket(reference, handle.bucket_id)
         return CacheCreateResult(handle=handle, reused=False)
 
     def get_reference_cache(self, cache_id: str) -> ReferenceCacheHandle:
@@ -658,6 +1021,11 @@ class InMemoryCoreMLCacheManager:
     ) -> None:
         handle.hit_count += 1
         handle.last_used_at = now
+
+    @staticmethod
+    def _record_resident_bucket(handle: ReferenceCacheHandle, bucket_id: str) -> None:
+        if bucket_id not in handle.resident_buckets:
+            handle.resident_buckets = (*handle.resident_buckets, bucket_id)
 
     def _condition_ids_for_reference(self, reference_cache_id: str) -> list[str]:
         return [
