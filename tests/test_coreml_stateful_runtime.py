@@ -32,6 +32,154 @@ def test_module_import_does_not_require_coremltools() -> None:
     assert "coremltools" not in sys.modules
 
 
+def test_backend_metrics_snapshot_separates_first_and_steady_predict() -> None:
+    coreml_stateful = load_coreml_stateful_module()
+
+    backend = coreml_stateful.CoreMLStatefulDenoiserBackend.__new__(
+        coreml_stateful.CoreMLStatefulDenoiserBackend
+    )
+    backend.branch_layout = coreml_stateful.BRANCH_LAYOUT_COND1
+    backend.state_layout = coreml_stateful.STATE_LAYOUT_PER_LAYER
+    backend.sequence_length = 100
+    backend.c_ctx_bucket = 416
+    backend._mlmodel = None
+    backend._prepare_state_count = 2
+    backend._predict_count = 4
+    backend._make_state_ms_total = 6.0
+    backend._write_state_ms_total = 14.0
+    backend._predict_ms_total = 20.0
+    backend._first_predict_ms = 8.0
+
+    snapshot = backend.metrics_snapshot()
+
+    assert snapshot["branch_layout"] == coreml_stateful.BRANCH_LAYOUT_COND1
+    assert snapshot["loaded"] is False
+    assert snapshot["first_predict_ms"] == 8.0
+    assert snapshot["steady_predict_count"] == 3
+    assert snapshot["total_steady_predict_ms"] == pytest.approx(12.0)
+    assert snapshot["avg_steady_predict_ms"] == pytest.approx(4.0)
+    assert snapshot["ne_placement_available"] is False
+    assert snapshot["ne_placement_summary"] is None
+
+
+def test_runtime_metrics_snapshot_safe_under_concurrent_backend_creation() -> None:
+    """Regression: metrics snapshot must not raise during concurrent dict mutation."""
+    from irodori_tts import inference_runtime
+
+    runtime = inference_runtime.InferenceRuntime.__new__(inference_runtime.InferenceRuntime)
+    runtime._coreml_stateful_backends = {}
+    runtime._coreml_stateful_backends_lock = threading.Lock()
+
+    class _MetricsBackend:
+        def metrics_snapshot(self) -> dict[str, Any]:
+            return {"branch_layout": "cond1"}
+
+    stop_event = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        i = 0
+        while not stop_event.is_set():
+            with runtime._coreml_stateful_dict_lock():
+                runtime._coreml_stateful_backends[(i, 0, "x", "cond1")] = _MetricsBackend()
+            i += 1
+            if i % 64 == 0:
+                with runtime._coreml_stateful_dict_lock():
+                    runtime._coreml_stateful_backends.clear()
+
+    def reader() -> None:
+        try:
+            for _ in range(200):
+                snapshots = runtime.coreml_stateful_metrics_snapshot()
+                assert all(isinstance(s, dict) for s in snapshots)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            stop_event.set()
+
+    writer_thread = threading.Thread(target=writer)
+    reader_thread = threading.Thread(target=reader)
+    writer_thread.start()
+    reader_thread.start()
+    reader_thread.join(timeout=5.0)
+    stop_event.set()
+    writer_thread.join(timeout=5.0)
+
+    assert not errors, errors
+
+
+def test_backend_metric_counters_safe_under_concurrent_increments() -> None:
+    """Increments and snapshots must not race on the per-backend metrics lock."""
+    coreml_stateful = load_coreml_stateful_module()
+
+    backend = coreml_stateful.CoreMLStatefulDenoiserBackend.__new__(
+        coreml_stateful.CoreMLStatefulDenoiserBackend
+    )
+    backend.branch_layout = coreml_stateful.BRANCH_LAYOUT_COND1
+    backend.state_layout = coreml_stateful.STATE_LAYOUT_PER_LAYER
+    backend.sequence_length = 1
+    backend.c_ctx_bucket = 1
+    backend._mlmodel = None
+    backend._prepare_state_count = 0
+    backend._predict_count = 0
+    backend._make_state_ms_total = 0.0
+    backend._write_state_ms_total = 0.0
+    backend._predict_ms_total = 0.0
+    backend._first_predict_ms = None
+    backend._metrics_lock = threading.Lock()
+
+    iterations = 500
+
+    def increment_predicts() -> None:
+        for i in range(iterations):
+            with backend._metrics_lock_for_snapshot():
+                backend._predict_count += 1
+                backend._predict_ms_total += 1.0
+                if backend._first_predict_ms is None:
+                    backend._first_predict_ms = 1.0
+                del i
+
+    def read_snapshots() -> None:
+        for _ in range(iterations):
+            snapshot = backend.metrics_snapshot()
+            assert snapshot["predict_count"] >= 0
+
+    t1 = threading.Thread(target=increment_predicts)
+    t2 = threading.Thread(target=read_snapshots)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+
+    assert backend._predict_count == iterations
+
+
+def test_backend_metrics_snapshot_steady_metrics_zero_when_no_predicts() -> None:
+    coreml_stateful = load_coreml_stateful_module()
+
+    backend = coreml_stateful.CoreMLStatefulDenoiserBackend.__new__(
+        coreml_stateful.CoreMLStatefulDenoiserBackend
+    )
+    backend.branch_layout = coreml_stateful.BRANCH_LAYOUT_COND1
+    backend.state_layout = coreml_stateful.STATE_LAYOUT_PER_LAYER
+    backend.sequence_length = 100
+    backend.c_ctx_bucket = 416
+    backend._mlmodel = None
+    backend._prepare_state_count = 0
+    backend._predict_count = 0
+    backend._make_state_ms_total = 0.0
+    backend._write_state_ms_total = 0.0
+    backend._predict_ms_total = 0.0
+    backend._first_predict_ms = None
+
+    snapshot = backend.metrics_snapshot()
+
+    assert snapshot["first_predict_ms"] is None
+    assert snapshot["steady_predict_count"] == 0
+    assert snapshot["total_steady_predict_ms"] == 0.0
+    assert snapshot["avg_steady_predict_ms"] is None
+
+
 class RopeCacheLeaf(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -546,6 +694,387 @@ def test_coreml_split_cond1_cfg_combines_independent_outputs(
         ("predict", BRANCH_LAYOUT_COND1, "cond"),
         ("predict", BRANCH_LAYOUT_COND1, "text_uncond"),
         ("predict", BRANCH_LAYOUT_COND1, "speaker_uncond"),
+    ]
+
+
+class JointFormulaBackend:
+    def __init__(self, branch_layout: str, calls: list[tuple[str, Any]]) -> None:
+        self.branch_layout = branch_layout
+        self.calls = calls
+        self.prepare_kinds = ["cond", "joint_uncond"]
+
+    def prepare_state(self, payload: Any) -> SimpleNamespace:
+        kind = self.prepare_kinds.pop(0)
+        self.calls.append(("prepare", self.branch_layout, kind, payload.batch_size))
+        return SimpleNamespace(kind=kind)
+
+    def predict_step(
+        self,
+        prepared_state: Any,
+        *,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        latent_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        del t, latent_mask
+        values = {"cond": 6.0, "joint_uncond": 1.0}
+        self.calls.append(("predict", self.branch_layout, prepared_state.kind))
+        return torch.full_like(x_t, values[prepared_state.kind])
+
+
+class AlternatingFormulaBackend:
+    def __init__(self, branch_layout: str, calls: list[tuple[str, Any]]) -> None:
+        self.branch_layout = branch_layout
+        self.calls = calls
+        self.prepare_kinds = ["cond", "alt_text", "alt_speaker"]
+
+    def prepare_state(self, payload: Any) -> SimpleNamespace:
+        kind = self.prepare_kinds.pop(0)
+        self.calls.append(("prepare", self.branch_layout, kind, payload.batch_size))
+        return SimpleNamespace(kind=kind)
+
+    def predict_step(
+        self,
+        prepared_state: Any,
+        *,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        latent_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        del t, latent_mask
+        values = {"cond": 10.0, "alt_text": 4.0, "alt_speaker": 2.0}
+        self.calls.append(("predict", self.branch_layout, prepared_state.kind))
+        return torch.full_like(x_t, values[prepared_state.kind])
+
+
+class SpeakerKvFormulaBackend:
+    """Fake backend that distinguishes scaled vs normal cond/text-uncond states."""
+
+    def __init__(self, branch_layout: str, calls: list[tuple[str, Any]]) -> None:
+        self.branch_layout = branch_layout
+        self.calls = calls
+        # Order: cond_normal, cond_scaled, text_uncond_normal, text_uncond_scaled, speaker_uncond
+        self.prepare_kinds = [
+            "cond_normal",
+            "cond_scaled",
+            "text_uncond_normal",
+            "text_uncond_scaled",
+            "speaker_uncond",
+        ]
+
+    def prepare_state(self, payload: Any) -> SimpleNamespace:
+        kind = self.prepare_kinds.pop(0)
+        self.calls.append(("prepare", self.branch_layout, kind, payload.batch_size))
+        return SimpleNamespace(kind=kind)
+
+    def predict_step(
+        self,
+        prepared_state: Any,
+        *,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        latent_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        del t, latent_mask
+        values = {
+            "cond_normal": 0.0,
+            "cond_scaled": 0.0,
+            "text_uncond_normal": 0.0,
+            "text_uncond_scaled": 0.0,
+            "speaker_uncond": 0.0,
+        }
+        self.calls.append(("predict", self.branch_layout, prepared_state.kind))
+        return torch.full_like(x_t, values[prepared_state.kind])
+
+
+def _make_runtime_with_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    factory: Any,
+) -> Any:
+    from irodori_tts import inference_runtime
+
+    monkeypatch.setattr(inference_runtime, "COREML_STATEFUL_BACKEND_FACTORY", factory)
+    runtime = inference_runtime.InferenceRuntime.__new__(inference_runtime.InferenceRuntime)
+    runtime.key = inference_runtime.RuntimeKey(checkpoint="tiny", model_device="cpu")
+    runtime.model_device = torch.device("cpu")
+    runtime.codec_device = torch.device("cpu")
+    runtime.model_cfg = TinyModel().cfg
+    runtime.train_cfg = None
+    runtime.model = TinyModel()
+    runtime.tokenizer = TinyTokenizer()
+    runtime.caption_tokenizer = None
+    runtime.codec = TinyCodec()
+    runtime.default_text_max_len = 2
+    runtime.default_caption_max_len = 2
+    runtime._infer_lock = threading.Lock()
+    runtime._coreml_stateful_backends = {}
+    return runtime
+
+
+def _joint_condition_handle() -> Any:
+    from irodori_tts.coreml_cache import (
+        BRANCH_LAYOUT_COND1,
+        BRANCH_LAYOUT_JOINT2,
+        STATE_LAYOUT_PER_LAYER,
+        ConditionCacheHandle,
+        expected_per_layer_state_names,
+    )
+
+    now = datetime.now(timezone.utc)
+    return ConditionCacheHandle(
+        id="cond_joint",
+        reference_cache_id="ref_test",
+        model_fingerprint="model:test",
+        tokenizer_fingerprint="tokenizer:test",
+        condition_fingerprint="condition:test",
+        bucket_id="S2_T2_R1_joint2",
+        state_layout=STATE_LAYOUT_PER_LAYER,
+        sequence_length=2,
+        text_len=2,
+        speaker_context_len=1,
+        speaker_context_len_bucket=1,
+        c_ctx_bucket=3,
+        branch_layouts=(BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_JOINT2),
+        mlstate_keys=expected_per_layer_state_names(),
+        created_at=now,
+        expires_at=None,
+        memory_bytes=0,
+        metadata={},
+    )
+
+
+def _alternating_condition_handle() -> Any:
+    from irodori_tts.coreml_cache import (
+        BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+        BRANCH_LAYOUT_ALTERNATING_TEXT2,
+        BRANCH_LAYOUT_COND1,
+        STATE_LAYOUT_PER_LAYER,
+        ConditionCacheHandle,
+        expected_per_layer_state_names,
+    )
+
+    now = datetime.now(timezone.utc)
+    return ConditionCacheHandle(
+        id="cond_alt",
+        reference_cache_id="ref_test",
+        model_fingerprint="model:test",
+        tokenizer_fingerprint="tokenizer:test",
+        condition_fingerprint="condition:test",
+        bucket_id="S2_T2_R1_alternating_speaker2",
+        state_layout=STATE_LAYOUT_PER_LAYER,
+        sequence_length=2,
+        text_len=2,
+        speaker_context_len=1,
+        speaker_context_len_bucket=1,
+        c_ctx_bucket=3,
+        branch_layouts=(
+            BRANCH_LAYOUT_COND1,
+            BRANCH_LAYOUT_ALTERNATING_TEXT2,
+            BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+        ),
+        mlstate_keys=expected_per_layer_state_names(),
+        created_at=now,
+        expires_at=None,
+        memory_bytes=0,
+        metadata={},
+    )
+
+
+def _independent_condition_handle() -> Any:
+    from irodori_tts.coreml_cache import (
+        BRANCH_LAYOUT_COND1,
+        BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3,
+        STATE_LAYOUT_PER_LAYER,
+        ConditionCacheHandle,
+        expected_per_layer_state_names,
+    )
+
+    now = datetime.now(timezone.utc)
+    return ConditionCacheHandle(
+        id="cond_ind",
+        reference_cache_id="ref_test",
+        model_fingerprint="model:test",
+        tokenizer_fingerprint="tokenizer:test",
+        condition_fingerprint="condition:test",
+        bucket_id="S2_T2_R1_independent_text_speaker3",
+        state_layout=STATE_LAYOUT_PER_LAYER,
+        sequence_length=2,
+        text_len=2,
+        speaker_context_len=1,
+        speaker_context_len_bucket=1,
+        c_ctx_bucket=3,
+        branch_layouts=(BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3),
+        mlstate_keys=expected_per_layer_state_names(),
+        created_at=now,
+        expires_at=None,
+        memory_bytes=0,
+        metadata={},
+    )
+
+
+def test_coreml_joint_cfg_combines_outputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from irodori_tts.coreml_cache import BRANCH_LAYOUT_COND1
+
+    calls: list[tuple[str, Any]] = []
+
+    def factory(runtime: Any, *, condition_cache: Any, branch_layout: str) -> JointFormulaBackend:
+        del runtime, condition_cache
+        calls.append(("factory", branch_layout))
+        return JointFormulaBackend(branch_layout, calls)
+
+    runtime = _make_runtime_with_factory(monkeypatch, factory)
+    z = runtime._sample_coreml_stateful_rf_cfg(
+        condition_cache=_joint_condition_handle(),
+        text_ids=torch.zeros((1, 2), dtype=torch.long),
+        text_mask=torch.ones((1, 2), dtype=torch.bool),
+        ref_latent=torch.zeros((1, 1, 2)),
+        ref_mask=torch.ones((1, 1), dtype=torch.bool),
+        sequence_length=2,
+        actual_sequence_length=2,
+        num_steps=1,
+        cfg_guidance_mode="joint",
+        cfg_scale_text=4.0,
+        cfg_scale_speaker=4.0,
+        cfg_min_t=0.0,
+        cfg_max_t=1.0,
+        seed=0,
+        truncation_factor=0.0,
+    )
+
+    expected_v = 6.0 + 4.0 * (6.0 - 1.0)
+    torch.testing.assert_close(z, torch.full_like(z, -0.999 * expected_v))
+    assert calls == [
+        ("factory", BRANCH_LAYOUT_COND1),
+        ("prepare", BRANCH_LAYOUT_COND1, "cond", 1),
+        ("prepare", BRANCH_LAYOUT_COND1, "joint_uncond", 1),
+        ("predict", BRANCH_LAYOUT_COND1, "cond"),
+        ("predict", BRANCH_LAYOUT_COND1, "joint_uncond"),
+    ]
+
+
+def test_coreml_joint_cfg_rejects_unequal_scales(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, Any]] = []
+
+    def factory(runtime: Any, *, condition_cache: Any, branch_layout: str) -> JointFormulaBackend:
+        del runtime, condition_cache
+        return JointFormulaBackend(branch_layout, calls)
+
+    runtime = _make_runtime_with_factory(monkeypatch, factory)
+    with pytest.raises(ValueError, match="joint"):
+        runtime._sample_coreml_stateful_rf_cfg(
+            condition_cache=_joint_condition_handle(),
+            text_ids=torch.zeros((1, 2), dtype=torch.long),
+            text_mask=torch.ones((1, 2), dtype=torch.bool),
+            ref_latent=torch.zeros((1, 1, 2)),
+            ref_mask=torch.ones((1, 1), dtype=torch.bool),
+            sequence_length=2,
+            actual_sequence_length=2,
+            num_steps=1,
+            cfg_guidance_mode="joint",
+            cfg_scale_text=2.0,
+            cfg_scale_speaker=4.0,
+            cfg_min_t=0.0,
+            cfg_max_t=1.0,
+            seed=0,
+            truncation_factor=0.0,
+        )
+
+
+def test_coreml_alternating_cfg_picks_branch_by_step_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from irodori_tts.coreml_cache import BRANCH_LAYOUT_COND1
+
+    calls: list[tuple[str, Any]] = []
+
+    def factory(
+        runtime: Any, *, condition_cache: Any, branch_layout: str
+    ) -> AlternatingFormulaBackend:
+        del runtime, condition_cache
+        calls.append(("factory", branch_layout))
+        return AlternatingFormulaBackend(branch_layout, calls)
+
+    runtime = _make_runtime_with_factory(monkeypatch, factory)
+    z = runtime._sample_coreml_stateful_rf_cfg(
+        condition_cache=_alternating_condition_handle(),
+        text_ids=torch.zeros((1, 2), dtype=torch.long),
+        text_mask=torch.ones((1, 2), dtype=torch.bool),
+        ref_latent=torch.zeros((1, 1, 2)),
+        ref_mask=torch.ones((1, 1), dtype=torch.bool),
+        sequence_length=2,
+        actual_sequence_length=2,
+        num_steps=2,
+        cfg_guidance_mode="alternating",
+        cfg_scale_text=2.0,
+        cfg_scale_speaker=3.0,
+        cfg_min_t=0.0,
+        cfg_max_t=1.0,
+        seed=0,
+        truncation_factor=0.0,
+    )
+    del z
+
+    # Step 0 -> "text", step 1 -> "speaker".
+    predict_calls = [call for call in calls if call[0] == "predict"]
+    assert predict_calls == [
+        ("predict", BRANCH_LAYOUT_COND1, "cond"),
+        ("predict", BRANCH_LAYOUT_COND1, "alt_text"),
+        ("predict", BRANCH_LAYOUT_COND1, "cond"),
+        ("predict", BRANCH_LAYOUT_COND1, "alt_speaker"),
+    ]
+
+
+def test_coreml_speaker_kv_scale_switches_state_at_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, Any]] = []
+
+    def factory(
+        runtime: Any, *, condition_cache: Any, branch_layout: str
+    ) -> SpeakerKvFormulaBackend:
+        del runtime, condition_cache
+        calls.append(("factory", branch_layout))
+        return SpeakerKvFormulaBackend(branch_layout, calls)
+
+    runtime = _make_runtime_with_factory(monkeypatch, factory)
+    runtime._sample_coreml_stateful_rf_cfg(
+        condition_cache=_independent_condition_handle(),
+        text_ids=torch.zeros((1, 2), dtype=torch.long),
+        text_mask=torch.ones((1, 2), dtype=torch.bool),
+        ref_latent=torch.zeros((1, 1, 2)),
+        ref_mask=torch.ones((1, 1), dtype=torch.bool),
+        sequence_length=2,
+        actual_sequence_length=2,
+        num_steps=2,
+        cfg_guidance_mode="independent",
+        cfg_scale_text=2.0,
+        cfg_scale_speaker=3.0,
+        cfg_min_t=0.0,
+        cfg_max_t=1.0,
+        seed=0,
+        truncation_factor=0.0,
+        speaker_kv_scale=2.5,
+        speaker_kv_min_t=0.5,
+    )
+
+    prepares = [call for call in calls if call[0] == "prepare"]
+    # cond_normal, cond_scaled, text_uncond_normal, text_uncond_scaled, speaker_uncond
+    assert [(call[2]) for call in prepares] == [
+        "cond_normal",
+        "cond_scaled",
+        "text_uncond_normal",
+        "text_uncond_scaled",
+        "speaker_uncond",
+    ]
+    # Steps: t=0.999 (>= 0.5 -> scaled), t=0.4995 (< 0.5 -> normal).
+    predict_kinds = [call[2] for call in calls if call[0] == "predict"]
+    assert predict_kinds == [
+        "cond_scaled",
+        "text_uncond_scaled",
+        "speaker_uncond",
+        "cond_normal",
+        "text_uncond_normal",
+        "speaker_uncond",
     ]
 
 

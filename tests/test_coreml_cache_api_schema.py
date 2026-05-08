@@ -231,6 +231,7 @@ def test_cond1_only_condition_cache_response_has_one_active_branch() -> None:
             "branches_active": 1,
         },
         "resident_states": ["cond1"],
+        "state_copies": 1,
         "created_at": "2026-01-01T00:00:00Z",
         "last_used_at": None,
         "hit_count": 0,
@@ -263,6 +264,7 @@ def test_bare_condition_cache_response_uses_get_schema_for_independent_cfg() -> 
             "branches_active": 3,
         },
         "resident_states": ["cond1", "independent_text_speaker3"],
+        "state_copies": 1,
         "created_at": "2026-01-01T00:00:00Z",
         "last_used_at": None,
         "hit_count": 0,
@@ -273,6 +275,64 @@ def test_bare_condition_cache_response_uses_get_schema_for_independent_cfg() -> 
     assert "shapes" not in response
     assert "memory_bytes" not in response
     assert_json_serializable(response)
+
+
+def test_condition_cache_response_for_joint_layout() -> None:
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=Clock())
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    result = manager.prepare_condition_cache(
+        condition_request(
+            reference.id,
+            branch_layouts=(
+                coreml_cache.BRANCH_LAYOUT_COND1,
+                coreml_cache.BRANCH_LAYOUT_JOINT2,
+            ),
+            condition_fingerprint="condition-joint",
+        ),
+    )
+
+    create_response = coreml_cache.condition_cache_response(result)
+    assert create_response["bucket_id"] == "S100_T256_R160_joint2"
+    assert create_response["branch_layouts"] == {
+        "cond": coreml_cache.BRANCH_LAYOUT_COND1,
+        "cfg_active": coreml_cache.BRANCH_LAYOUT_JOINT2,
+    }
+    assert create_response["shapes"]["branches_active"] == 2
+
+    get_response = coreml_cache.condition_cache_response(result.handle)
+    assert get_response["cfg"]["mode"] == "joint"
+    assert get_response["resident_states"] == [
+        coreml_cache.BRANCH_LAYOUT_COND1,
+        coreml_cache.BRANCH_LAYOUT_JOINT2,
+    ]
+
+
+def test_condition_cache_response_for_alternating_two_layout() -> None:
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=Clock())
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    result = manager.prepare_condition_cache(
+        condition_request(
+            reference.id,
+            branch_layouts=(
+                coreml_cache.BRANCH_LAYOUT_COND1,
+                coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2,
+                coreml_cache.BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+            ),
+            condition_fingerprint="condition-alt-both",
+        ),
+    )
+
+    create_response = coreml_cache.condition_cache_response(result)
+    assert create_response["branch_layouts"] == {
+        "cond": coreml_cache.BRANCH_LAYOUT_COND1,
+        "cfg_active": [
+            coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2,
+            coreml_cache.BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+        ],
+    }
+
+    get_response = coreml_cache.condition_cache_response(result.handle)
+    assert get_response["cfg"]["mode"] == "alternating"
 
 
 def test_cache_create_status_code_distinguishes_created_and_reused() -> None:

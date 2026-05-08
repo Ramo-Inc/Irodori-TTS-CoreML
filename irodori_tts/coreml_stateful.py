@@ -6,6 +6,7 @@ import math
 import platform
 import tempfile
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,8 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .coreml_cache import (
+    BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+    BRANCH_LAYOUT_ALTERNATING_TEXT2,
     BRANCH_LAYOUT_COND1,
     BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3,
+    BRANCH_LAYOUT_JOINT2,
     STATE_LAYOUT_PER_LAYER,
     branch_count_for_layout,
     expected_per_layer_state_names,
@@ -26,8 +30,11 @@ from .coreml_cache import (
 from .model import TextToLatentRFDiT
 
 __all__ = (
+    "BRANCH_LAYOUT_ALTERNATING_SPEAKER2",
+    "BRANCH_LAYOUT_ALTERNATING_TEXT2",
     "BRANCH_LAYOUT_COND1",
     "BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3",
+    "BRANCH_LAYOUT_JOINT2",
     "STATE_LAYOUT_PER_LAYER",
     "CoreMLPreparedState",
     "CoreMLStatefulDenoiserBackend",
@@ -486,6 +493,66 @@ class CoreMLStatefulDenoiserBackend:
         self._load_lock = threading.Lock()
         self._predict_lock = threading.Lock()
         self._temporary_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._metrics_lock = threading.Lock()
+        self._prepare_state_count = 0
+        self._predict_count = 0
+        self._make_state_ms_total = 0.0
+        self._write_state_ms_total = 0.0
+        self._predict_ms_total = 0.0
+        self._first_predict_ms: float | None = None
+
+    def _metrics_lock_for_snapshot(self) -> threading.Lock:
+        lock = getattr(self, "_metrics_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._metrics_lock = lock
+        return lock
+
+    def precompile(self) -> None:
+        """Ensure the underlying MLModel is converted/loaded without running predict."""
+        self._ensure_mlmodel()
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        with self._metrics_lock_for_snapshot():
+            prepare_count = self._prepare_state_count
+            predict_count = self._predict_count
+            first_predict_ms = self._first_predict_ms
+            make_state_ms_total = self._make_state_ms_total
+            write_state_ms_total = self._write_state_ms_total
+            predict_ms_total = self._predict_ms_total
+        steady_count = max(0, predict_count - 1) if first_predict_ms is not None else 0
+        steady_total_ms = (
+            (predict_ms_total - first_predict_ms)
+            if first_predict_ms is not None and predict_count > 1
+            else 0.0
+        )
+        avg_steady_predict_ms = steady_total_ms / steady_count if steady_count > 0 else None
+        snapshot: dict[str, Any] = {
+            "branch_layout": self.branch_layout,
+            "state_layout": self.state_layout,
+            "sequence_length": self.sequence_length,
+            "c_ctx_bucket": self.c_ctx_bucket,
+            "loaded": self._mlmodel is not None,
+            "prepare_state_count": prepare_count,
+            "predict_count": predict_count,
+            "total_make_state_ms": make_state_ms_total,
+            "total_write_state_ms": write_state_ms_total,
+            "total_predict_ms": predict_ms_total,
+            "avg_make_state_ms": (
+                make_state_ms_total / prepare_count if prepare_count > 0 else 0.0
+            ),
+            "avg_write_state_ms": (
+                write_state_ms_total / prepare_count if prepare_count > 0 else 0.0
+            ),
+            "avg_predict_ms": (predict_ms_total / predict_count if predict_count > 0 else 0.0),
+            "first_predict_ms": first_predict_ms,
+            "steady_predict_count": steady_count,
+            "total_steady_predict_ms": steady_total_ms,
+            "avg_steady_predict_ms": avg_steady_predict_ms,
+            "ne_placement_available": False,
+            "ne_placement_summary": None,
+        }
+        return snapshot
 
     def prepare_state(self, payload: StatefulContextPayload) -> CoreMLPreparedState:
         if payload.branch_layout != self.branch_layout:
@@ -501,13 +568,21 @@ class CoreMLStatefulDenoiserBackend:
 
         mlmodel = self._ensure_mlmodel()
         try:
+            make_t0 = time.perf_counter()
             state = mlmodel.make_state()
+            make_ms = (time.perf_counter() - make_t0) * 1000.0
+            write_t0 = time.perf_counter()
             for name, value in state_write_payloads(payload).items():
                 state.write_state(name=name, value=value)
+            write_ms = (time.perf_counter() - write_t0) * 1000.0
         except Exception as exc:
             raise CoreMLStatefulUnavailableError(
                 f"CoreML state initialization failed: {type(exc).__name__}: {_first_line(exc)}"
             ) from exc
+        with self._metrics_lock_for_snapshot():
+            self._prepare_state_count += 1
+            self._make_state_ms_total += make_ms
+            self._write_state_ms_total += write_ms
         return CoreMLPreparedState(
             state=state,
             branch_layout=self.branch_layout,
@@ -535,13 +610,20 @@ class CoreMLStatefulDenoiserBackend:
         }
         try:
             with self._predict_lock, prepared_state.lock:
+                predict_t0 = time.perf_counter()
                 prediction = mlmodel.predict(predict_inputs, state=prepared_state.state)
+                predict_ms = (time.perf_counter() - predict_t0) * 1000.0
         except Exception as exc:
             raise CoreMLStatefulUnavailableError(
                 f"CoreML stateful predict failed: {type(exc).__name__}: {_first_line(exc)}"
             ) from exc
         if not isinstance(prediction, Mapping) or not prediction:
             raise CoreMLStatefulUnavailableError("CoreML stateful predict returned no outputs")
+        with self._metrics_lock_for_snapshot():
+            self._predict_count += 1
+            self._predict_ms_total += predict_ms
+            if self._first_predict_ms is None:
+                self._first_predict_ms = predict_ms
         output = np.asarray(next(iter(prediction.values())))
         return torch.as_tensor(output, device=x_t.device, dtype=x_t.dtype)
 

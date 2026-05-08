@@ -18,10 +18,16 @@ from safetensors.torch import load_file as load_safetensors_file
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .coreml_cache import (
+    ALLOWED_CONDITION_BRANCH_LAYOUTS,
+    BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+    BRANCH_LAYOUT_ALTERNATING_TEXT2,
     BRANCH_LAYOUT_COND1,
     BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3,
+    BRANCH_LAYOUT_JOINT2,
     STATE_LAYOUT_PER_LAYER,
     ConditionCacheHandle,
+    CoreMLConditionBucket,
+    expected_per_layer_state_names,
 )
 from .coreml_stateful import (
     CoreMLStatefulDenoiserBackend,
@@ -30,7 +36,7 @@ from .coreml_stateful import (
 )
 from .lora import checkpoint_state_uses_lora
 from .model import TextToLatentRFDiT
-from .rf import _make_rng, sample_euler_rf_cfg, temporal_score_rescale
+from .rf import _make_rng, sample_euler_rf_cfg, scale_speaker_kv_cache, temporal_score_rescale
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 
@@ -446,6 +452,7 @@ class InferenceRuntime:
         self.default_caption_max_len = default_caption_max_len
         self._infer_lock = threading.Lock()
         self._coreml_stateful_backends: dict[tuple[int, int, str, str], object] = {}
+        self._coreml_stateful_backends_lock = threading.Lock()
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -630,6 +637,13 @@ class InferenceRuntime:
         )
         return ref_latent_patched, ref_mask
 
+    def _coreml_stateful_dict_lock(self) -> threading.Lock:
+        lock = getattr(self, "_coreml_stateful_backends_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._coreml_stateful_backends_lock = lock
+        return lock
+
     def _get_coreml_stateful_backend(
         self,
         *,
@@ -642,15 +656,62 @@ class InferenceRuntime:
             str(condition_cache.state_layout),
             str(branch_layout),
         )
-        backend = self._coreml_stateful_backends.get(key)
-        if backend is None:
-            backend = COREML_STATEFUL_BACKEND_FACTORY(
-                self,
-                condition_cache=condition_cache,
-                branch_layout=branch_layout,
-            )
-            self._coreml_stateful_backends[key] = backend
+        with self._coreml_stateful_dict_lock():
+            backend = self._coreml_stateful_backends.get(key)
+            if backend is None:
+                backend = COREML_STATEFUL_BACKEND_FACTORY(
+                    self,
+                    condition_cache=condition_cache,
+                    branch_layout=branch_layout,
+                )
+                self._coreml_stateful_backends[key] = backend
         return backend
+
+    def precompile_coreml_stateful_buckets(
+        self,
+        buckets: list[CoreMLConditionBucket] | tuple[CoreMLConditionBucket, ...],
+    ) -> None:
+        """Precompile cond1 CoreML backends for each supplied bucket."""
+        from datetime import datetime, timezone
+
+        for bucket in buckets:
+            synthetic_handle = ConditionCacheHandle(
+                id="precompile",
+                reference_cache_id="precompile",
+                model_fingerprint="precompile",
+                tokenizer_fingerprint="precompile",
+                condition_fingerprint="precompile",
+                bucket_id=bucket.bucket_id(BRANCH_LAYOUT_COND1),
+                state_layout=STATE_LAYOUT_PER_LAYER,
+                sequence_length=int(bucket.sequence_length),
+                text_len=int(bucket.text_len),
+                speaker_context_len=int(bucket.speaker_context_len_bucket),
+                speaker_context_len_bucket=int(bucket.speaker_context_len_bucket),
+                c_ctx_bucket=int(bucket.c_ctx_bucket),
+                branch_layouts=(BRANCH_LAYOUT_COND1,),
+                mlstate_keys=expected_per_layer_state_names(),
+                created_at=datetime.now(timezone.utc),
+                expires_at=None,
+                memory_bytes=0,
+                metadata={},
+            )
+            backend = self._get_coreml_stateful_backend(
+                condition_cache=synthetic_handle,
+                branch_layout=BRANCH_LAYOUT_COND1,
+            )
+            precompile = getattr(backend, "precompile", None)
+            if callable(precompile):
+                precompile()
+
+    def coreml_stateful_metrics_snapshot(self) -> list[dict[str, object]]:
+        with self._coreml_stateful_dict_lock():
+            backends = list(self._coreml_stateful_backends.values())
+        snapshots: list[dict[str, object]] = []
+        for backend in backends:
+            snapshot_fn = getattr(backend, "metrics_snapshot", None)
+            if callable(snapshot_fn):
+                snapshots.append(snapshot_fn())
+        return snapshots
 
     def synthesize_with_condition_cache(
         self,
@@ -728,15 +789,27 @@ class InferenceRuntime:
             raise ValueError(f"rescale_k must be > 0, got {rescale_k}")
         if rescale_sigma is not None and rescale_sigma <= 0:
             raise ValueError(f"rescale_sigma must be > 0, got {rescale_sigma}")
-        if req.speaker_kv_scale is not None:
-            raise CoreMLStatefulUnavailableError(
-                "speaker_kv_scale is not supported by the CoreML stateful fast path"
-            )
+
+        speaker_kv_scale = None if req.speaker_kv_scale is None else float(req.speaker_kv_scale)
+        speaker_kv_min_t: float | None = None
+        speaker_kv_max_layers = (
+            None if req.speaker_kv_max_layers is None else int(req.speaker_kv_max_layers)
+        )
+        if speaker_kv_scale is not None:
+            if speaker_kv_scale <= 0:
+                raise ValueError(f"speaker_kv_scale must be > 0, got {speaker_kv_scale}")
+            speaker_kv_min_t = 0.9 if req.speaker_kv_min_t is None else float(req.speaker_kv_min_t)
+            if not (0.0 <= speaker_kv_min_t <= 1.0):
+                raise ValueError(f"speaker_kv_min_t must be in [0, 1], got {speaker_kv_min_t}")
+            if speaker_kv_max_layers is not None and speaker_kv_max_layers < 0:
+                raise ValueError(
+                    f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
+                )
 
         cfg_mode = str(req.cfg_guidance_mode).strip().lower()
-        if cfg_mode != "independent":
+        if cfg_mode not in {"independent", "joint", "alternating"}:
             raise CoreMLStatefulUnavailableError(
-                f"CoreML stateful fast path supports independent CFG only, got {cfg_mode!r}"
+                f"CoreML stateful fast path does not support cfg_guidance_mode={cfg_mode!r}"
             )
         cfg_min_t = float(req.cfg_min_t)
         cfg_max_t = float(req.cfg_max_t)
@@ -761,15 +834,39 @@ class InferenceRuntime:
             )
 
         branch_layouts = tuple(condition_cache.branch_layouts)
-        active_cfg_requested = bool(
-            cfg_scale_text > 0.0
-            or cfg_scale_speaker > 0.0
-            or (has_caption_text and cfg_scale_caption > 0.0)
-        )
-        if active_cfg_requested and BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3 not in branch_layouts:
-            raise CoreMLStatefulUnavailableError(
-                "active independent CFG requires independent_text_speaker3 CoreML state"
-            )
+        active_cfg_requested = bool(cfg_scale_text > 0.0 or cfg_scale_speaker > 0.0)
+        enabled_alt_names: list[str] = []
+        if cfg_mode == "alternating":
+            if cfg_scale_text > 0.0:
+                enabled_alt_names.append("text")
+            if cfg_scale_speaker > 0.0:
+                enabled_alt_names.append("speaker")
+        if active_cfg_requested:
+            if cfg_mode == "independent" and BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3 not in (
+                branch_layouts
+            ):
+                raise CoreMLStatefulUnavailableError(
+                    "active independent CFG requires independent_text_speaker3 CoreML state"
+                )
+            if cfg_mode == "joint" and BRANCH_LAYOUT_JOINT2 not in branch_layouts:
+                raise CoreMLStatefulUnavailableError(
+                    "active joint CFG requires joint2 CoreML state"
+                )
+            if cfg_mode == "alternating":
+                if (
+                    "text" in enabled_alt_names
+                    and BRANCH_LAYOUT_ALTERNATING_TEXT2 not in branch_layouts
+                ):
+                    raise CoreMLStatefulUnavailableError(
+                        "alternating text CFG requires alternating_text2 CoreML state"
+                    )
+                if (
+                    "speaker" in enabled_alt_names
+                    and BRANCH_LAYOUT_ALTERNATING_SPEAKER2 not in branch_layouts
+                ):
+                    raise CoreMLStatefulUnavailableError(
+                        "alternating speaker CFG requires alternating_speaker2 CoreML state"
+                    )
 
         stage_timings: list[tuple[str, float]] = []
         if req.seed is None:
@@ -827,6 +924,7 @@ class InferenceRuntime:
                 sequence_length=bucket_steps,
                 actual_sequence_length=patched_steps,
                 num_steps=int(req.num_steps),
+                cfg_guidance_mode=cfg_mode,
                 cfg_scale_text=cfg_scale_text,
                 cfg_scale_speaker=cfg_scale_speaker,
                 cfg_min_t=cfg_min_t,
@@ -835,6 +933,9 @@ class InferenceRuntime:
                 truncation_factor=truncation_factor,
                 rescale_k=rescale_k,
                 rescale_sigma=rescale_sigma,
+                speaker_kv_scale=speaker_kv_scale,
+                speaker_kv_min_t=speaker_kv_min_t,
+                speaker_kv_max_layers=speaker_kv_max_layers,
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf_coreml_stateful", stage_sec))
@@ -899,10 +1000,7 @@ class InferenceRuntime:
                 f"unsupported CoreML state layout: {condition_cache.state_layout}"
             )
         branch_layouts = tuple(condition_cache.branch_layouts)
-        if branch_layouts not in {
-            (BRANCH_LAYOUT_COND1,),
-            (BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3),
-        }:
+        if branch_layouts not in ALLOWED_CONDITION_BRANCH_LAYOUTS:
             raise CoreMLStatefulUnavailableError(
                 f"unsupported CoreML branch layouts: {branch_layouts}"
             )
@@ -915,7 +1013,7 @@ class InferenceRuntime:
                 "speaker-conditioned checkpoints are required by the CoreML stateful fast path"
             )
         cfg_mode = str(req.cfg_guidance_mode).strip().lower()
-        if cfg_mode in {"joint", "alternating"}:
+        if cfg_mode not in {"independent", "joint", "alternating"}:
             raise CoreMLStatefulUnavailableError(
                 f"cfg_guidance_mode={cfg_mode!r} is not supported by the CoreML stateful fast path"
             )
@@ -931,14 +1029,18 @@ class InferenceRuntime:
         sequence_length: int,
         actual_sequence_length: int,
         num_steps: int,
-        cfg_scale_text: float,
-        cfg_scale_speaker: float,
-        cfg_min_t: float,
-        cfg_max_t: float,
-        seed: int,
-        truncation_factor: float | None,
-        rescale_k: float | None,
-        rescale_sigma: float | None,
+        cfg_guidance_mode: str = "independent",
+        cfg_scale_text: float = 0.0,
+        cfg_scale_speaker: float = 0.0,
+        cfg_min_t: float = 0.5,
+        cfg_max_t: float = 1.0,
+        seed: int = 0,
+        truncation_factor: float | None = None,
+        rescale_k: float | None = None,
+        rescale_sigma: float | None = None,
+        speaker_kv_scale: float | None = None,
+        speaker_kv_min_t: float | None = None,
+        speaker_kv_max_layers: int | None = None,
     ) -> torch.Tensor:
         device = self.model_device
         dtype = next(self.model.parameters()).dtype
@@ -983,106 +1085,262 @@ class InferenceRuntime:
                 "speaker state is required by the CoreML stateful fast path"
             )
 
-        context_kv_cond = self.model.build_context_kv_cache(
-            text_state=text_state_cond,
-            speaker_state=speaker_state_cond,
-            caption_state=None,
-        )
-        payload_cond = pack_context_kv_state(
-            context_kv_cond,
-            text_mask=text_mask_cond,
-            speaker_mask=speaker_mask_cond,
-            speaker_context_bucket=int(condition_cache.speaker_context_len_bucket),
-            branch_layout=BRANCH_LAYOUT_COND1,
-        )
+        speaker_context_bucket = int(condition_cache.speaker_context_len_bucket)
         backend_cond = self._get_coreml_stateful_backend(
             condition_cache=condition_cache,
             branch_layout=BRANCH_LAYOUT_COND1,
         )
-        state_cond = backend_cond.prepare_state(payload_cond)
 
-        branch_layouts = tuple(condition_cache.branch_layouts)
-        state_text_uncond = None
-        state_speaker_uncond = None
-        use_split_cfg_states = BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3 in branch_layouts and (
-            cfg_scale_text > 0.0 or cfg_scale_speaker > 0.0
+        def _pack_and_prepare(
+            *,
+            text_state: torch.Tensor,
+            text_mask_val: torch.Tensor,
+            speaker_state: torch.Tensor,
+            speaker_mask_val: torch.Tensor,
+            apply_speaker_kv_scale: bool,
+        ):
+            context_kv = self.model.build_context_kv_cache(
+                text_state=text_state,
+                speaker_state=speaker_state,
+                caption_state=None,
+            )
+            if apply_speaker_kv_scale and speaker_kv_scale is not None:
+                scale_speaker_kv_cache(
+                    context_kv_cache=context_kv,
+                    scale=float(speaker_kv_scale),
+                    max_layers=speaker_kv_max_layers,
+                )
+            payload = pack_context_kv_state(
+                context_kv,
+                text_mask=text_mask_val,
+                speaker_mask=speaker_mask_val,
+                speaker_context_bucket=speaker_context_bucket,
+                branch_layout=BRANCH_LAYOUT_COND1,
+            )
+            return backend_cond.prepare_state(payload)
+
+        text_state_uncond = torch.zeros_like(text_state_cond)
+        text_mask_uncond = torch.zeros_like(text_mask_cond)
+        speaker_state_uncond = torch.zeros_like(speaker_state_cond)
+        speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
+
+        cfg_mode = str(cfg_guidance_mode).strip().lower()
+        enabled_cfg_names: list[str] = []
+        cfg_scales: dict[str, float] = {}
+        if cfg_scale_text > 0.0:
+            enabled_cfg_names.append("text")
+            cfg_scales["text"] = float(cfg_scale_text)
+        if cfg_scale_speaker > 0.0:
+            enabled_cfg_names.append("speaker")
+            cfg_scales["speaker"] = float(cfg_scale_speaker)
+        active_cfg_possible = bool(enabled_cfg_names)
+
+        # Always prepare cond state(s). If speaker_kv_scale set, prepare both normal and scaled.
+        state_cond_normal = _pack_and_prepare(
+            text_state=text_state_cond,
+            text_mask_val=text_mask_cond,
+            speaker_state=speaker_state_cond,
+            speaker_mask_val=speaker_mask_cond,
+            apply_speaker_kv_scale=False,
         )
-        if use_split_cfg_states:
-            text_state_uncond = torch.zeros_like(text_state_cond)
-            text_mask_uncond = torch.zeros_like(text_mask_cond)
-            speaker_state_uncond = torch.zeros_like(speaker_state_cond)
-            speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
-
-            context_kv_text_uncond = self.model.build_context_kv_cache(
-                text_state=text_state_uncond,
-                speaker_state=speaker_state_cond,
-                caption_state=None,
-            )
-            payload_text_uncond = pack_context_kv_state(
-                context_kv_text_uncond,
-                text_mask=text_mask_uncond,
-                speaker_mask=speaker_mask_cond,
-                speaker_context_bucket=int(condition_cache.speaker_context_len_bucket),
-                branch_layout=BRANCH_LAYOUT_COND1,
-            )
-            state_text_uncond = backend_cond.prepare_state(payload_text_uncond)
-
-            context_kv_speaker_uncond = self.model.build_context_kv_cache(
+        state_cond_scaled = None
+        if speaker_kv_scale is not None:
+            state_cond_scaled = _pack_and_prepare(
                 text_state=text_state_cond,
-                speaker_state=speaker_state_uncond,
-                caption_state=None,
+                text_mask_val=text_mask_cond,
+                speaker_state=speaker_state_cond,
+                speaker_mask_val=speaker_mask_cond,
+                apply_speaker_kv_scale=True,
             )
-            payload_speaker_uncond = pack_context_kv_state(
-                context_kv_speaker_uncond,
-                text_mask=text_mask_cond,
-                speaker_mask=speaker_mask_uncond,
-                speaker_context_bucket=int(condition_cache.speaker_context_len_bucket),
-                branch_layout=BRANCH_LAYOUT_COND1,
-            )
-            state_speaker_uncond = backend_cond.prepare_state(payload_speaker_uncond)
+
+        # Mode-specific uncond states.
+        state_independent_text_uncond_normal = None
+        state_independent_text_uncond_scaled = None
+        state_independent_speaker_uncond = None
+        state_joint_uncond = None
+        state_alternating: dict[str, dict[str, object | None]] = {}
+
+        if active_cfg_possible:
+            if cfg_mode == "independent":
+                # text-uncond branch keeps speaker_cond, so it benefits from speaker_kv_scale.
+                if "text" in enabled_cfg_names:
+                    state_independent_text_uncond_normal = _pack_and_prepare(
+                        text_state=text_state_uncond,
+                        text_mask_val=text_mask_uncond,
+                        speaker_state=speaker_state_cond,
+                        speaker_mask_val=speaker_mask_cond,
+                        apply_speaker_kv_scale=False,
+                    )
+                    if speaker_kv_scale is not None:
+                        state_independent_text_uncond_scaled = _pack_and_prepare(
+                            text_state=text_state_uncond,
+                            text_mask_val=text_mask_uncond,
+                            speaker_state=speaker_state_cond,
+                            speaker_mask_val=speaker_mask_cond,
+                            apply_speaker_kv_scale=True,
+                        )
+                # speaker-uncond branch zeroes speaker, so scaling has no effect.
+                if "speaker" in enabled_cfg_names:
+                    state_independent_speaker_uncond = _pack_and_prepare(
+                        text_state=text_state_cond,
+                        text_mask_val=text_mask_cond,
+                        speaker_state=speaker_state_uncond,
+                        speaker_mask_val=speaker_mask_uncond,
+                        apply_speaker_kv_scale=False,
+                    )
+            elif cfg_mode == "joint":
+                # Joint requires equal scales. Validate by reusing resolve_cfg_scales semantics.
+                if len(enabled_cfg_names) > 1:
+                    joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
+                    if max(joint_scales) - min(joint_scales) > 1e-6:
+                        raise ValueError(
+                            "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
+                            "set matching cfg_scale_text/cfg_scale_speaker or use cfg_scale.",
+                        )
+                # joint_uncond zeroes both text and speaker -> no speaker, scaling no-op.
+                state_joint_uncond = _pack_and_prepare(
+                    text_state=text_state_uncond,
+                    text_mask_val=text_mask_uncond,
+                    speaker_state=speaker_state_uncond,
+                    speaker_mask_val=speaker_mask_uncond,
+                    apply_speaker_kv_scale=False,
+                )
+            elif cfg_mode == "alternating":
+                if "text" in enabled_cfg_names:
+                    # text alt-uncond keeps speaker_cond.
+                    text_alt_normal = _pack_and_prepare(
+                        text_state=text_state_uncond,
+                        text_mask_val=text_mask_uncond,
+                        speaker_state=speaker_state_cond,
+                        speaker_mask_val=speaker_mask_cond,
+                        apply_speaker_kv_scale=False,
+                    )
+                    text_alt_scaled = None
+                    if speaker_kv_scale is not None:
+                        text_alt_scaled = _pack_and_prepare(
+                            text_state=text_state_uncond,
+                            text_mask_val=text_mask_uncond,
+                            speaker_state=speaker_state_cond,
+                            speaker_mask_val=speaker_mask_cond,
+                            apply_speaker_kv_scale=True,
+                        )
+                    state_alternating["text"] = {
+                        "normal": text_alt_normal,
+                        "scaled": text_alt_scaled,
+                    }
+                if "speaker" in enabled_cfg_names:
+                    speaker_alt_normal = _pack_and_prepare(
+                        text_state=text_state_cond,
+                        text_mask_val=text_mask_cond,
+                        speaker_state=speaker_state_uncond,
+                        speaker_mask_val=speaker_mask_uncond,
+                        apply_speaker_kv_scale=False,
+                    )
+                    state_alternating["speaker"] = {
+                        "normal": speaker_alt_normal,
+                        "scaled": None,
+                    }
+            else:
+                raise CoreMLStatefulUnavailableError(
+                    f"CoreML stateful fast path does not support cfg_guidance_mode={cfg_mode!r}"
+                )
 
         for i in range(int(num_steps)):
             t = t_schedule[i]
             t_next = t_schedule[i + 1]
             tt = torch.full((1,), t, device=device, dtype=dtype)
-            use_cfg = bool(cfg_scale_text > 0.0 or cfg_scale_speaker > 0.0) and (
+            use_cfg = active_cfg_possible and (
                 float(cfg_min_t) <= float(t.item()) <= float(cfg_max_t)
             )
+            speaker_kv_active_now = (
+                speaker_kv_scale is not None
+                and speaker_kv_min_t is not None
+                and float(t.item()) >= float(speaker_kv_min_t)
+            )
+            state_cond_for_step = (
+                state_cond_scaled
+                if speaker_kv_active_now and state_cond_scaled is not None
+                else state_cond_normal
+            )
+            cond = backend_cond.predict_step(
+                state_cond_for_step,
+                x_t=x_t,
+                t=tt,
+                latent_mask=latent_mask,
+            )
             if use_cfg:
-                if state_text_uncond is None or state_speaker_uncond is None:
-                    raise CoreMLStatefulUnavailableError(
-                        "active CFG requires independent_text_speaker3 CoreML state"
+                if cfg_mode == "independent":
+                    v = cond
+                    if "text" in enabled_cfg_names:
+                        text_state_for_step = (
+                            state_independent_text_uncond_scaled
+                            if (
+                                speaker_kv_active_now
+                                and state_independent_text_uncond_scaled is not None
+                            )
+                            else state_independent_text_uncond_normal
+                        )
+                        if text_state_for_step is None:
+                            raise CoreMLStatefulUnavailableError(
+                                "independent text CFG requires text uncond state",
+                            )
+                        text_uncond = backend_cond.predict_step(
+                            text_state_for_step,
+                            x_t=x_t,
+                            t=tt,
+                            latent_mask=latent_mask,
+                        )
+                        v = v + cfg_scales["text"] * (cond - text_uncond)
+                    if "speaker" in enabled_cfg_names:
+                        if state_independent_speaker_uncond is None:
+                            raise CoreMLStatefulUnavailableError(
+                                "independent speaker CFG requires speaker uncond state",
+                            )
+                        speaker_uncond = backend_cond.predict_step(
+                            state_independent_speaker_uncond,
+                            x_t=x_t,
+                            t=tt,
+                            latent_mask=latent_mask,
+                        )
+                        v = v + cfg_scales["speaker"] * (cond - speaker_uncond)
+                elif cfg_mode == "joint":
+                    if state_joint_uncond is None:
+                        raise CoreMLStatefulUnavailableError(
+                            "joint CFG requires joint uncond state",
+                        )
+                    joint_uncond = backend_cond.predict_step(
+                        state_joint_uncond,
+                        x_t=x_t,
+                        t=tt,
+                        latent_mask=latent_mask,
                     )
-                cond = backend_cond.predict_step(
-                    state_cond,
-                    x_t=x_t,
-                    t=tt,
-                    latent_mask=latent_mask,
-                )
-                text_uncond = backend_cond.predict_step(
-                    state_text_uncond,
-                    x_t=x_t,
-                    t=tt,
-                    latent_mask=latent_mask,
-                )
-                speaker_uncond = backend_cond.predict_step(
-                    state_speaker_uncond,
-                    x_t=x_t,
-                    t=tt,
-                    latent_mask=latent_mask,
-                )
-                v = (
-                    cond
-                    + float(cfg_scale_text) * (cond - text_uncond)
-                    + float(cfg_scale_speaker) * (cond - speaker_uncond)
-                )
+                    joint_scale = cfg_scales[enabled_cfg_names[0]]
+                    v = cond + joint_scale * (cond - joint_uncond)
+                elif cfg_mode == "alternating":
+                    alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
+                    alt_states = state_alternating.get(alt_name)
+                    if alt_states is None:
+                        raise CoreMLStatefulUnavailableError(
+                            f"alternating {alt_name} CFG requires alt uncond state",
+                        )
+                    alt_state_for_step = (
+                        alt_states["scaled"]
+                        if speaker_kv_active_now and alt_states.get("scaled") is not None
+                        else alt_states["normal"]
+                    )
+                    alt_uncond = backend_cond.predict_step(
+                        alt_state_for_step,
+                        x_t=x_t,
+                        t=tt,
+                        latent_mask=latent_mask,
+                    )
+                    v = cond + cfg_scales[alt_name] * (cond - alt_uncond)
+                else:
+                    raise CoreMLStatefulUnavailableError(
+                        f"CoreML stateful fast path does not support cfg_guidance_mode={cfg_mode!r}"
+                    )
             else:
-                v = backend_cond.predict_step(
-                    state_cond,
-                    x_t=x_t,
-                    t=tt,
-                    latent_mask=latent_mask,
-                )
+                v = cond
 
             if rescale_k is not None and rescale_sigma is not None:
                 v = temporal_score_rescale(

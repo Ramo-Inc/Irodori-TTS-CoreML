@@ -434,6 +434,208 @@ def test_condition_cache_rejects_invalid_cfg_numbers(
     assert_cache_error(response, 400, "cache_validation_error")
 
 
+@pytest.mark.parametrize(
+    ("cfg", "expected_bucket_id", "expected_active_branches"),
+    [
+        (
+            {"mode": "joint", "scale_text": 4.0, "scale_speaker": 4.0, "scale_caption": 0.0},
+            "S100_T256_R160_joint2",
+            2,
+        ),
+        (
+            {"mode": "alternating", "scale_text": 3.0, "scale_speaker": 5.0},
+            "S100_T256_R160_alternating_speaker2",
+            2,
+        ),
+        (
+            {"mode": "alternating", "scale_text": 3.0, "scale_speaker": 0.0},
+            "S100_T256_R160_alternating_text2",
+            2,
+        ),
+    ],
+)
+def test_condition_cache_supports_joint_and_alternating_cfg(
+    client: TestClient,
+    cfg: dict[str, object],
+    expected_bucket_id: str,
+    expected_active_branches: int,
+) -> None:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "joint or alternating cache",
+            "cfg": cfg,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["bucket_id"] == expected_bucket_id
+    assert body["shapes"]["branches_active"] == expected_active_branches
+
+
+def test_condition_cache_supports_speaker_kv_scale_in_cfg(client: TestClient) -> None:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "speaker kv scale cache",
+            "cfg": {
+                "mode": "independent",
+                "speaker_kv_scale": 2.5,
+                "speaker_kv_min_t": 0.7,
+                "speaker_kv_max_layers": 4,
+            },
+        },
+    )
+
+    assert response.status_code == 201
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"mode": "independent", "speaker_kv_scale": 0.0},
+        {"mode": "independent", "speaker_kv_scale": -1.0},
+        {"mode": "independent", "speaker_kv_scale": 2.0, "speaker_kv_min_t": -0.1},
+        {"mode": "independent", "speaker_kv_scale": 2.0, "speaker_kv_min_t": 1.5},
+        {"mode": "independent", "speaker_kv_scale": 2.0, "speaker_kv_max_layers": -1},
+    ],
+)
+def test_condition_cache_rejects_invalid_speaker_kv_settings(
+    client: TestClient,
+    cfg: dict[str, object],
+) -> None:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "invalid speaker kv",
+            "cfg": cfg,
+        },
+    )
+
+    assert_cache_error(response, 400, "cache_validation_error")
+
+
+def test_cache_metrics_endpoint_does_not_load_runtime(client: TestClient) -> None:
+    response = client.get("/v1/tts/cache-metrics")
+    assert response.status_code == 200
+    body = response.json()
+    assert "cache_manager" in body
+    assert body["coreml_stateful_backends"] == []
+    snapshot = body["cache_manager"]
+    assert "reference_hits" in snapshot
+    assert "evictions" in snapshot
+
+
+def test_condition_cache_rejects_bare_joint_with_unequal_default_scales(
+    client: TestClient,
+) -> None:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "joint with unequal defaults",
+            "cfg": {"mode": "joint"},
+        },
+    )
+
+    assert_cache_error(response, 400, "cache_validation_error")
+
+
+def test_condition_cache_accepts_joint_with_equal_scales(client: TestClient) -> None:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "joint with equal scales",
+            "cfg": {"mode": "joint", "scale_text": 4.0, "scale_speaker": 4.0},
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["bucket_id"] == "S100_T256_R160_joint2"
+    assert body["state_copies"] == 1
+
+
+def test_condition_cache_rejects_positive_scale_caption_universally(
+    client: TestClient,
+) -> None:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "caption cfg",
+            "cfg": {"mode": "independent", "scale_caption": 2.0},
+        },
+    )
+
+    assert_cache_error(response, 400, "cache_validation_error")
+
+
+def test_condition_cache_rejects_alternating_with_positive_scale_caption(
+    client: TestClient,
+) -> None:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "alternating with caption",
+            "cfg": {
+                "mode": "alternating",
+                "scale_text": 3.0,
+                "scale_speaker": 5.0,
+                "scale_caption": 2.0,
+            },
+        },
+    )
+
+    assert_cache_error(response, 400, "cache_validation_error")
+
+
+def test_condition_cache_state_copies_doubled_for_speaker_kv_scale(
+    client: TestClient,
+) -> None:
+    reference = create_reference_cache(client)
+    base_cfg = {"mode": "independent"}
+    base_response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "memory baseline",
+            "cfg": base_cfg,
+        },
+    )
+    assert base_response.status_code == 201
+    base = base_response.json()
+
+    scaled_response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "memory baseline",
+            "cfg": {**base_cfg, "speaker_kv_scale": 2.5},
+        },
+    )
+    assert scaled_response.status_code == 201
+    scaled = scaled_response.json()
+
+    assert base["state_copies"] == 1
+    assert scaled["state_copies"] == 2
+    assert scaled["memory_bytes"] == 2 * base["memory_bytes"]
+    assert scaled["id"] != base["id"]
+
+
 def test_condition_cache_delete_then_get_returns_not_found(client: TestClient) -> None:
     reference = create_reference_cache(client)
     condition = create_independent_condition_cache(client, str(reference["id"]))

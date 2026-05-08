@@ -210,3 +210,74 @@ def test_per_layer_state_shapes_rejects_unknown_branch_layout() -> None:
 
     with pytest.raises(ValueError, match="unknown branch_layout"):
         coreml_cache.per_layer_state_shapes(bucket, branch_layout="split")
+
+
+@pytest.mark.parametrize(
+    "branch_layout",
+    [
+        coreml_cache.BRANCH_LAYOUT_JOINT2,
+        coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2,
+        coreml_cache.BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+    ],
+)
+def test_branch_count_for_two_branch_layouts(branch_layout: str) -> None:
+    assert coreml_cache.branch_count_for_layout(branch_layout) == 2
+
+
+def test_per_layer_state_shapes_for_joint2_layout() -> None:
+    bucket = coreml_cache.CoreMLConditionBucket(
+        sequence_length=100,
+        text_len=256,
+        speaker_context_len_bucket=160,
+    )
+    shapes = coreml_cache.per_layer_state_shapes(
+        bucket,
+        branch_layout=coreml_cache.BRANCH_LAYOUT_JOINT2,
+    )
+    for state_name in coreml_cache.expected_per_layer_state_names()[:-1]:
+        assert shapes[state_name] == (2, 416, 20, 64)
+    assert shapes["valid_mask_state"] == (2, 416)
+
+
+def test_kv_memory_bytes_for_joint_and_alternating_layouts() -> None:
+    bucket = coreml_cache.CoreMLConditionBucket(
+        sequence_length=100,
+        text_len=256,
+        speaker_context_len_bucket=160,
+    )
+    one_branch = coreml_cache.kv_bytes_per_branch(bucket)
+    assert (
+        coreml_cache.kv_memory_bytes(
+            bucket,
+            (coreml_cache.BRANCH_LAYOUT_COND1, coreml_cache.BRANCH_LAYOUT_JOINT2),
+        )
+        == 3 * one_branch
+    )
+    assert (
+        coreml_cache.kv_memory_bytes(
+            bucket,
+            (
+                coreml_cache.BRANCH_LAYOUT_COND1,
+                coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2,
+                coreml_cache.BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+            ),
+        )
+        == 5 * one_branch
+    )
+
+
+@pytest.mark.parametrize(
+    "branch_layouts",
+    [
+        (coreml_cache.BRANCH_LAYOUT_COND1, coreml_cache.BRANCH_LAYOUT_JOINT2),
+        (coreml_cache.BRANCH_LAYOUT_COND1, coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2),
+        (coreml_cache.BRANCH_LAYOUT_COND1, coreml_cache.BRANCH_LAYOUT_ALTERNATING_SPEAKER2),
+        (
+            coreml_cache.BRANCH_LAYOUT_COND1,
+            coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2,
+            coreml_cache.BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+        ),
+    ],
+)
+def test_canonical_branch_layout_tuples_accepted(branch_layouts: tuple[str, ...]) -> None:
+    assert branch_layouts in coreml_cache.ALLOWED_CONDITION_BRANCH_LAYOUTS

@@ -399,26 +399,265 @@ def test_auto_with_mismatched_condition_returns_conflict_before_runtime(
     assert runtime.requests == []
 
 
-@pytest.mark.parametrize(
-    "irodori",
-    [
-        "not-an-object",
-        {"cache_mode": "prepare"},
-        {"cache_mode": "refresh"},
-    ],
-)
-def test_invalid_irodori_or_unsupported_modes_use_cache_error_envelope(
+def test_invalid_irodori_object_uses_cache_error_envelope(
     client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
-    irodori: object,
 ) -> None:
     client, runtime, calls = client_runtime
 
     response = client.post(
         "/v1/audio/speech",
-        json=speech_payload(irodori=irodori),
+        json=speech_payload(irodori="not-an-object"),
     )
 
     assert_cache_error(response, 400, "cache_validation_error")
+    assert calls["get_runtime"] == 0
+    assert runtime.requests == []
+
+
+@pytest.mark.parametrize("cache_mode", ["prepare", "refresh"])
+def test_prepare_and_refresh_modes_use_fast_path_with_cache_headers(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+    cache_mode: str,
+) -> None:
+    client, runtime, calls = client_runtime
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(irodori={"cache_mode": cache_mode}),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/L16"
+    assert response.headers["X-Irodori-Denoiser-Backend"] == "coreml-stateful"
+    assert response.headers["X-Irodori-Condition-Cache-Id"].startswith("cond_")
+    assert response.headers["X-Irodori-Reference-Cache-Id"].startswith("ref_")
+    assert calls["get_runtime"] == 1
+    assert runtime.requests == []
+    assert len(runtime.fast_requests) == 1
+
+
+def test_prepare_with_multi_segment_speech_returns_conflict(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, runtime, calls = client_runtime
+    long_text = " ".join(["longtext"] * 40)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "input": long_text,
+            "response_format": "pcm",
+            "irodori": {"cache_mode": "prepare"},
+        },
+    )
+
+    assert_cache_error(response, 409, "cache_mismatch", cache_mode="prepare")
+    assert calls["get_runtime"] == 0
+    assert runtime.requests == []
+
+
+def test_prepare_rejects_mismatched_cache_id(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, runtime, calls = client_runtime
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(
+            irodori={"cache_mode": "prepare", "cache_id": "cond_unrelated"},
+        ),
+    )
+
+    assert_cache_error(
+        response,
+        409,
+        "cache_mismatch",
+        cache_id="cond_unrelated",
+        cache_mode="prepare",
+    )
+    assert calls["get_runtime"] == 0
+    assert runtime.requests == []
+
+
+def test_prepare_with_mismatched_cache_id_does_not_mutate_cache(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, runtime, calls = client_runtime
+
+    metrics_before = client.get("/v1/tts/cache-metrics").json()
+    assert metrics_before["cache_manager"]["reference_count"] == 0
+    assert metrics_before["cache_manager"]["condition_count"] == 0
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(
+            irodori={"cache_mode": "prepare", "cache_id": "cond_unrelated"},
+        ),
+    )
+    assert_cache_error(response, 409, "cache_mismatch")
+
+    metrics_after = client.get("/v1/tts/cache-metrics").json()
+    assert metrics_after["cache_manager"]["reference_count"] == 0
+    assert metrics_after["cache_manager"]["condition_count"] == 0
+    assert metrics_after["cache_manager"]["evictions"] == 0
+    assert calls["get_runtime"] == 0
+    assert runtime.requests == []
+
+
+def test_refresh_with_mismatched_cache_id_does_not_delete_existing_caches(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, runtime, calls = client_runtime
+
+    prepare_response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(irodori={"cache_mode": "prepare"}),
+    )
+    assert prepare_response.status_code == 200
+    prepared_condition_id = prepare_response.headers["X-Irodori-Condition-Cache-Id"]
+    prepared_reference_id = prepare_response.headers["X-Irodori-Reference-Cache-Id"]
+
+    metrics_before = client.get("/v1/tts/cache-metrics").json()["cache_manager"]
+    assert metrics_before["reference_count"] == 1
+    assert metrics_before["condition_count"] == 1
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(
+            irodori={"cache_mode": "refresh", "cache_id": "cond_unrelated"},
+        ),
+    )
+    assert_cache_error(response, 409, "cache_mismatch")
+
+    # The previously prepared caches must still be intact.
+    assert client.get(f"/v1/tts/condition-caches/{prepared_condition_id}").status_code == 200
+    assert client.get(f"/v1/tts/reference-caches/{prepared_reference_id}").status_code == 200
+
+    metrics_after = client.get("/v1/tts/cache-metrics").json()["cache_manager"]
+    assert metrics_after["reference_count"] == 1
+    assert metrics_after["condition_count"] == 1
+
+
+def test_required_cache_is_marked_recently_used(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, runtime, calls = client_runtime
+    condition = create_matching_condition_cache(client)
+    assert calls["get_runtime"] == 0
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(
+            irodori={"cache_mode": "require", "cache_id": condition["id"]},
+        ),
+    )
+    assert response.status_code == 200
+
+    get_response = client.get(f"/v1/tts/condition-caches/{condition['id']}")
+    assert get_response.status_code == 200
+    body = get_response.json()
+    assert body["hit_count"] >= 1
+    assert body["last_used_at"] is not None
+
+
+def _create_condition_cache(
+    client: TestClient,
+    *,
+    cfg: dict[str, object],
+    input_text: str = SPEECH_TEXT,
+    caption: str = CAPTION,
+    seconds: float = 2.0,
+) -> dict[str, object]:
+    reference = create_reference_cache(client)
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": input_text,
+            "caption": caption,
+            "seconds": seconds,
+            "cfg": cfg,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"mode": "joint", "scale_text": 4.0, "scale_speaker": 4.0, "scale_caption": 0.0},
+        {"mode": "alternating", "scale_text": 3.0, "scale_speaker": 5.0},
+    ],
+)
+def test_speech_require_with_joint_or_alternating_cfg_uses_fast_path(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+    cfg: dict[str, object],
+) -> None:
+    client, runtime, calls = client_runtime
+    condition = _create_condition_cache(client, cfg=cfg)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(
+            irodori={"cache_mode": "require", "cache_id": condition["id"], "cfg": cfg},
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-Irodori-Denoiser-Backend"] == "coreml-stateful"
+    assert response.headers["X-Irodori-Condition-Cache-Id"] == condition["id"]
+    assert calls["get_runtime"] == 1
+    assert runtime.requests == []
+    assert len(runtime.fast_requests) == 1
+    request, _handle = runtime.fast_requests[0]
+    assert request.cfg_guidance_mode == cfg["mode"]
+
+
+def test_speech_require_with_speaker_kv_scale_passes_to_runtime(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, runtime, calls = client_runtime
+    cfg = {
+        "mode": "independent",
+        "speaker_kv_scale": 2.5,
+        "speaker_kv_min_t": 0.7,
+        "speaker_kv_max_layers": 4,
+    }
+    condition = _create_condition_cache(client, cfg=cfg)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(
+            irodori={"cache_mode": "require", "cache_id": condition["id"], "cfg": cfg},
+        ),
+    )
+
+    assert response.status_code == 200
+    assert calls["get_runtime"] == 1
+    assert len(runtime.fast_requests) == 1
+    request, _handle = runtime.fast_requests[0]
+    assert request.speaker_kv_scale == 2.5
+    assert request.speaker_kv_min_t == 0.7
+    assert request.speaker_kv_max_layers == 4
+
+
+def test_speech_rejects_positive_caption_cfg_for_speech_cache_validation(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, runtime, calls = client_runtime
+
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(
+            irodori={
+                "cache_mode": "prepare",
+                "cfg": {"mode": "independent", "scale_caption": 2.0},
+            },
+        ),
+    )
+
+    assert_cache_error(response, 400, "cache_validation_error", cache_mode="prepare")
     assert calls["get_runtime"] == 0
     assert runtime.requests == []
 

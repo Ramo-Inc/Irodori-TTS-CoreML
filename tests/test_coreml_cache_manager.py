@@ -227,17 +227,40 @@ def test_peek_condition_cache_does_not_increment_hits_and_preserves_errors() -> 
         manager.peek_condition_cache(expiring_condition.id)
 
 
-def test_require_condition_cache_matches_without_incrementing_hits() -> None:
-    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=Clock())
+def test_require_condition_cache_records_hit_after_validation() -> None:
+    clock = Clock()
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=clock)
     reference = manager.prepare_reference_cache(reference_request()).handle
     request = condition_request(reference.id)
     condition = manager.prepare_condition_cache(request).handle
 
+    clock.advance(1)
     required = manager.require_condition_cache(condition.id, request)
 
     assert required is condition
+    assert condition.hit_count == 1
+    assert condition.last_used_at == clock.current
+    assert reference.last_used_at == clock.current
+    assert manager.metrics_snapshot()["condition_hits"] == 1
+
+
+def test_require_condition_cache_mismatch_does_not_count_hit_or_update_lru() -> None:
+    from dataclasses import replace
+
+    clock = Clock()
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=clock)
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    request = condition_request(reference.id)
+    condition = manager.prepare_condition_cache(request).handle
+    changed = replace(request, condition_fingerprint="condition-mismatch")
+
+    clock.advance(5)
+    with pytest.raises(coreml_cache.CacheConflictError):
+        manager.require_condition_cache(condition.id, changed)
+
     assert condition.hit_count == 0
     assert condition.last_used_at is None
+    assert manager.metrics_snapshot()["condition_hits"] == 0
 
 
 def test_require_condition_cache_rejects_changed_condition_fingerprint() -> None:
@@ -369,6 +392,195 @@ def test_reference_cache_request_rejects_invalid_inputs(overrides: dict[str, obj
 
     with pytest.raises(coreml_cache.CacheValidationError):
         coreml_cache.ReferenceCacheRequest(**kwargs)
+
+
+def test_peek_does_not_count_hits_or_update_last_used() -> None:
+    clock = Clock()
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=clock)
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    condition = manager.prepare_condition_cache(condition_request(reference.id)).handle
+
+    clock.advance(1)
+    assert manager.peek_reference_cache(reference.id) is reference
+    assert manager.peek_condition_cache(condition.id) is condition
+
+    snapshot = manager.metrics_snapshot()
+    assert snapshot["reference_hits"] == 0
+    assert snapshot["condition_hits"] == 0
+    assert reference.hit_count == 0
+    assert condition.hit_count == 0
+    assert reference.last_used_at is None
+    assert condition.last_used_at is None
+
+
+def test_metrics_snapshot_tracks_hits_misses_and_memory() -> None:
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=Clock())
+    snapshot = manager.metrics_snapshot()
+
+    assert snapshot["reference_hits"] == 0
+    assert snapshot["reference_misses"] == 0
+    assert snapshot["condition_hits"] == 0
+    assert snapshot["condition_misses"] == 0
+    assert snapshot["evictions"] == 0
+    assert snapshot["evicted_bytes"] == 0
+    assert snapshot["total_memory_bytes"] == 0
+    assert snapshot["max_memory_bytes"] == -1
+
+    reference = manager.prepare_reference_cache(reference_request(memory_bytes=512)).handle
+    condition = manager.prepare_condition_cache(condition_request(reference.id)).handle
+
+    assert manager.get_reference_cache(reference.id) is reference
+    with pytest.raises(coreml_cache.CacheNotFoundError):
+        manager.get_reference_cache("ref_missing")
+    assert manager.get_condition_cache(condition.id) is condition
+    with pytest.raises(coreml_cache.CacheNotFoundError):
+        manager.get_condition_cache("cond_missing")
+
+    snapshot = manager.metrics_snapshot()
+    assert snapshot["reference_hits"] == 1
+    assert snapshot["reference_misses"] == 1
+    assert snapshot["condition_hits"] == 1
+    assert snapshot["condition_misses"] == 1
+    assert snapshot["total_memory_bytes"] == 512 + condition.memory_bytes
+
+
+def test_lru_eviction_removes_least_recently_used_condition_first() -> None:
+    clock = Clock()
+    one_branch = coreml_cache.kv_bytes_per_branch(condition_bucket())
+    budget = 4 * one_branch + 1
+    manager = coreml_cache.InMemoryCoreMLCacheManager(
+        clock=clock,
+        max_memory_bytes=budget,
+    )
+    reference = manager.prepare_reference_cache(reference_request()).handle
+
+    older = manager.prepare_condition_cache(
+        condition_request(reference.id, condition_fingerprint="older"),
+    ).handle
+    clock.advance(1)
+    newer = manager.prepare_condition_cache(
+        condition_request(reference.id, condition_fingerprint="newer"),
+    ).handle
+
+    snapshot = manager.metrics_snapshot()
+    assert snapshot["evictions"] == 1
+    assert snapshot["evicted_bytes"] == older.memory_bytes
+    assert manager.metrics_snapshot()["total_memory_bytes"] == newer.memory_bytes
+    with pytest.raises(coreml_cache.CacheNotFoundError):
+        manager.get_condition_cache(older.id)
+    assert manager.get_condition_cache(newer.id) is newer
+
+
+def test_required_condition_cache_is_kept_over_older_unused_caches() -> None:
+    bucket = condition_bucket()
+    one_branch = coreml_cache.kv_bytes_per_branch(bucket)
+    # Allow exactly two condition caches to coexist; a third forces eviction.
+    budget = 8 * one_branch + 1
+    clock = Clock()
+    manager = coreml_cache.InMemoryCoreMLCacheManager(
+        clock=clock,
+        max_memory_bytes=budget,
+    )
+    reference = manager.prepare_reference_cache(reference_request()).handle
+
+    older = manager.prepare_condition_cache(
+        condition_request(reference.id, condition_fingerprint="older"),
+    ).handle
+    clock.advance(1)
+    middle_request = condition_request(reference.id, condition_fingerprint="middle")
+    middle = manager.prepare_condition_cache(middle_request).handle
+
+    clock.advance(1)
+    manager.require_condition_cache(
+        older.id, condition_request(reference.id, condition_fingerprint="older")
+    )
+
+    clock.advance(1)
+    new_handle = manager.prepare_condition_cache(
+        condition_request(reference.id, condition_fingerprint="newest"),
+    ).handle
+
+    # `middle` was the least-recently used and should be evicted; the
+    # required `older` cache must survive even though it was created earliest.
+    with pytest.raises(coreml_cache.CacheNotFoundError):
+        manager.get_condition_cache(middle.id)
+    assert manager.peek_condition_cache(older.id) is older
+    assert manager.peek_condition_cache(new_handle.id) is new_handle
+
+
+def test_lru_eviction_keeps_protected_new_handle_even_if_over_budget() -> None:
+    bucket = condition_bucket()
+    one_branch = coreml_cache.kv_bytes_per_branch(bucket)
+    manager = coreml_cache.InMemoryCoreMLCacheManager(
+        clock=Clock(),
+        max_memory_bytes=one_branch,
+    )
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    condition = manager.prepare_condition_cache(condition_request(reference.id)).handle
+
+    snapshot = manager.metrics_snapshot()
+    assert snapshot["total_memory_bytes"] == condition.memory_bytes
+    assert snapshot["total_memory_bytes"] > one_branch
+    assert manager.get_condition_cache(condition.id) is condition
+
+
+def test_speaker_kv_scale_doubles_condition_memory_and_lru_budget() -> None:
+    bucket = condition_bucket()
+    one_branch = coreml_cache.kv_bytes_per_branch(bucket)
+    base_request = condition_request("ref_existing")
+    request_state2 = coreml_cache.ConditionCacheRequest(
+        reference_cache_id=base_request.reference_cache_id,
+        model_fingerprint=base_request.model_fingerprint,
+        tokenizer_fingerprint=base_request.tokenizer_fingerprint,
+        condition_fingerprint=base_request.condition_fingerprint,
+        bucket=base_request.bucket,
+        speaker_context_len=base_request.speaker_context_len,
+        branch_layouts=base_request.branch_layouts,
+        ttl_seconds=base_request.ttl_seconds,
+        metadata=base_request.metadata,
+        state_copies=2,
+    )
+    # Same arithmetic as the manager's accounting:
+    base_memory = coreml_cache.kv_memory_bytes(bucket, base_request.branch_layouts)
+    scaled_memory = coreml_cache.kv_memory_bytes(bucket, request_state2.branch_layouts) * 2
+    assert scaled_memory == 2 * base_memory
+    assert scaled_memory > base_memory + one_branch
+
+
+def test_invalid_max_memory_bytes_rejected() -> None:
+    with pytest.raises(coreml_cache.CacheValidationError):
+        coreml_cache.InMemoryCoreMLCacheManager(max_memory_bytes=0)
+    with pytest.raises(coreml_cache.CacheValidationError):
+        coreml_cache.InMemoryCoreMLCacheManager(max_memory_bytes=True)
+
+
+@pytest.mark.parametrize(
+    "branch_layouts",
+    [
+        (coreml_cache.BRANCH_LAYOUT_COND1, coreml_cache.BRANCH_LAYOUT_JOINT2),
+        (coreml_cache.BRANCH_LAYOUT_COND1, coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2),
+        (
+            coreml_cache.BRANCH_LAYOUT_COND1,
+            coreml_cache.BRANCH_LAYOUT_ALTERNATING_TEXT2,
+            coreml_cache.BRANCH_LAYOUT_ALTERNATING_SPEAKER2,
+        ),
+    ],
+)
+def test_condition_cache_accepts_joint_and_alternating_layouts(
+    branch_layouts: tuple[str, ...],
+) -> None:
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=Clock())
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    handle = manager.prepare_condition_cache(
+        condition_request(reference.id, branch_layouts=branch_layouts),
+    ).handle
+
+    assert handle.branch_layouts == branch_layouts
+    one_branch = coreml_cache.kv_bytes_per_branch(condition_bucket())
+    expected_branches = sum(
+        coreml_cache.branch_count_for_layout(layout) for layout in branch_layouts
+    )
+    assert handle.memory_bytes == expected_branches * one_branch
 
 
 @pytest.mark.parametrize(
