@@ -28,6 +28,7 @@ from irodori_tts.coreml_cache import (
     CacheExpiredError,
     CacheNotFoundError,
     CacheValidationError,
+    ConditionCacheHandle,
     ConditionCacheRequest,
     CoreMLConditionBucket,
     InMemoryCoreMLCacheManager,
@@ -38,6 +39,7 @@ from irodori_tts.coreml_cache import (
     normalize_speech_cache_mode,
     reference_cache_response,
 )
+from irodori_tts.coreml_stateful import CoreMLStatefulUnavailableError
 from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
@@ -203,6 +205,23 @@ def _cache_error_response(
         cache_mode=cache_mode,
     )
     return JSONResponse(status_code=error.status_code, content=error.payload)
+
+
+def _coreml_backend_error_response(
+    exc: CoreMLStatefulUnavailableError,
+    *,
+    cache_id: str | None = None,
+    cache_mode: str | None = None,
+) -> JSONResponse:
+    error: dict[str, object] = {
+        "type": "coreml_backend_unavailable",
+        "message": str(exc),
+    }
+    if cache_id is not None:
+        error["cache_id"] = cache_id
+    if cache_mode is not None:
+        error["cache_mode"] = cache_mode
+    return JSONResponse(status_code=503, content={"error": error})
 
 
 def _cache_require_object(payload: Any) -> dict[str, Any]:
@@ -507,17 +526,33 @@ def _condition_branch_layouts(
     payload: dict[str, Any],
     cfg: dict[str, Any],
 ) -> tuple[str, ...] | list[str]:
+    canonical = _canonical_condition_branch_layouts(cfg)
     value = payload.get("branch_layouts", _MISSING)
     if value is not _MISSING:
         if not isinstance(value, list | tuple):
             raise CacheValidationError("branch_layouts must be a list")
-        return value
+        explicit = tuple(value)
+        if explicit != canonical:
+            raise CacheValidationError("branch_layouts conflict with cfg")
+        return explicit
 
-    mode = cfg["mode"]
-    if mode == "independent":
+    return canonical
+
+
+def _canonical_condition_branch_layouts(cfg: dict[str, Any]) -> tuple[str, ...]:
+    if _cfg_requires_independent_branch_layout(cfg):
         return (BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3)
+    return (BRANCH_LAYOUT_COND1,)
+
+
+def _cfg_requires_independent_branch_layout(cfg: dict[str, Any]) -> bool:
+    mode = cfg["mode"]
     if mode in {"cond", "none"}:
-        return (BRANCH_LAYOUT_COND1,)
+        return False
+    if mode == "independent":
+        return any(
+            float(cfg[field]) > 0.0 for field in ("scale_text", "scale_speaker", "scale_caption")
+        )
     raise CacheValidationError("cfg.mode must be independent, cond, or none")
 
 
@@ -722,6 +757,30 @@ def _speech_condition_cache_request(
     )
 
 
+def _speech_fast_path_cfg(irodori: dict[str, Any] | None) -> dict[str, float | str]:
+    condition_payload = dict(irodori or {})
+    if "cfg" not in condition_payload:
+        condition_payload["cfg"] = {"mode": "independent"}
+    cfg = _condition_cfg(condition_payload)
+    if cfg["mode"] in {"cond", "none"}:
+        return {
+            "guidance_mode": "independent",
+            "scale_text": 0.0,
+            "scale_caption": 0.0,
+            "scale_speaker": 0.0,
+            "min_t": float(cfg["min_t"]),
+            "max_t": float(cfg["max_t"]),
+        }
+    return {
+        "guidance_mode": "independent",
+        "scale_text": float(cfg["scale_text"]),
+        "scale_caption": float(cfg["scale_caption"]),
+        "scale_speaker": float(cfg["scale_speaker"]),
+        "min_t": float(cfg["min_t"]),
+        "max_t": float(cfg["max_t"]),
+    }
+
+
 def _validate_speech_cache_extension(
     irodori: dict[str, Any] | None,
     cache_mode: str,
@@ -730,9 +789,9 @@ def _validate_speech_cache_extension(
     caption: str | None,
     settings: ServerSettings,
     cache_manager: InMemoryCoreMLCacheManager,
-) -> None:
+) -> ConditionCacheHandle | None:
     if cache_mode == CACHE_MODE_OFF:
-        return
+        return None
     if cache_mode in {CACHE_MODE_PREPARE, CACHE_MODE_REFRESH}:
         raise CacheValidationError(
             f"cache_mode={cache_mode} is not supported for /v1/audio/speech",
@@ -740,7 +799,7 @@ def _validate_speech_cache_extension(
     if cache_mode == CACHE_MODE_REQUIRE and cache_id is None:
         raise CacheValidationError("irodori.cache_id is required when cache_mode=require")
     if cache_id is None:
-        return
+        return None
     if len(segment_plan.segments) != 1:
         raise CacheConflictError("single cache_id cannot be used with multi-segment speech")
 
@@ -748,7 +807,7 @@ def _validate_speech_cache_extension(
         condition_handle = cache_manager.peek_condition_cache(cache_id)
     except (CacheExpiredError, CacheNotFoundError):
         if cache_mode == CACHE_MODE_AUTO:
-            return
+            return None
         raise
 
     try:
@@ -768,10 +827,10 @@ def _validate_speech_cache_extension(
             segment_plan.segments[0],
             caption,
         )
-        cache_manager.require_condition_cache(cache_id, expected_request)
+        return cache_manager.require_condition_cache(cache_id, expected_request)
     except (CacheExpiredError, CacheNotFoundError):
         if cache_mode == CACHE_MODE_AUTO:
-            return
+            return None
         raise
 
 
@@ -1313,8 +1372,9 @@ def create_app(settings: ServerSettings) -> FastAPI:
         seed = _optional_int(data, "seed", None)
         caption = _resolve_caption(data)
         segment_plan = _build_speech_segment_plan(data, text, settings)
+        condition_cache_handle: ConditionCacheHandle | None = None
         try:
-            _validate_speech_cache_extension(
+            condition_cache_handle = _validate_speech_cache_extension(
                 irodori,
                 str(cache_mode),
                 cache_id,
@@ -1337,23 +1397,69 @@ def create_app(settings: ServerSettings) -> FastAPI:
             audio_segments: list[Any] = []
             sample_rate: int | None = None
             channel_count: int | None = None
+            denoiser_backend = (
+                "coreml-stateful" if condition_cache_handle is not None else "pytorch"
+            )
+            condition_cache_id_header = (
+                condition_cache_handle.id if condition_cache_handle is not None else None
+            )
+            fast_path_cfg = (
+                _speech_fast_path_cfg(irodori) if condition_cache_handle is not None else None
+            )
             for segment_index, segment in enumerate(segment_plan.segments):
                 segment_seed = None if seed is None else int(seed) + segment_index
-                result = await asyncio.to_thread(
-                    runtime.synthesize,
-                    SamplingRequest(
-                        text=segment.text,
-                        caption=caption,
-                        ref_wav=str(settings.reference_wav),
-                        ref_latent=None,
-                        no_ref=False,
-                        num_steps=int(num_steps),
-                        seconds=float(segment.seconds),
-                        max_ref_seconds=settings.max_ref_seconds,
-                        seed=segment_seed,
-                    ),
-                    log_fn=print if settings.log_timings else None,
+                sampling_request = SamplingRequest(
+                    text=segment.text,
+                    caption=caption,
+                    ref_wav=str(settings.reference_wav),
+                    ref_latent=None,
+                    no_ref=False,
+                    num_steps=int(num_steps),
+                    seconds=float(segment.seconds),
+                    max_ref_seconds=settings.max_ref_seconds,
+                    seed=segment_seed,
                 )
+                if fast_path_cfg is not None:
+                    sampling_request.cfg_guidance_mode = str(fast_path_cfg["guidance_mode"])
+                    sampling_request.cfg_scale_text = float(fast_path_cfg["scale_text"])
+                    sampling_request.cfg_scale_caption = float(fast_path_cfg["scale_caption"])
+                    sampling_request.cfg_scale_speaker = float(fast_path_cfg["scale_speaker"])
+                    sampling_request.cfg_min_t = float(fast_path_cfg["min_t"])
+                    sampling_request.cfg_max_t = float(fast_path_cfg["max_t"])
+
+                if condition_cache_handle is None:
+                    result = await asyncio.to_thread(
+                        runtime.synthesize,
+                        sampling_request,
+                        log_fn=print if settings.log_timings else None,
+                    )
+                else:
+                    try:
+                        synthesize_with_condition_cache = getattr(
+                            runtime,
+                            "synthesize_with_condition_cache",
+                            None,
+                        )
+                        if synthesize_with_condition_cache is None:
+                            raise CoreMLStatefulUnavailableError(
+                                "runtime does not expose synthesize_with_condition_cache"
+                            )
+                        result = await asyncio.to_thread(
+                            synthesize_with_condition_cache,
+                            sampling_request,
+                            condition_cache=condition_cache_handle,
+                            log_fn=print if settings.log_timings else None,
+                        )
+                    except CoreMLStatefulUnavailableError:
+                        if cache_mode != CACHE_MODE_AUTO:
+                            raise
+                        denoiser_backend = "pytorch"
+                        condition_cache_id_header = None
+                        result = await asyncio.to_thread(
+                            runtime.synthesize,
+                            sampling_request,
+                            log_fn=print if settings.log_timings else None,
+                        )
                 audio = _normalize_audio_segment(result.audio)
                 result_sample_rate = int(result.sample_rate)
                 result_channel_count = int(audio.shape[0])
@@ -1372,12 +1478,19 @@ def create_app(settings: ServerSettings) -> FastAPI:
             audio_bytes = _serialize_audio(audio, sample_rate, output_format)
         except HTTPException:
             raise
+        except CoreMLStatefulUnavailableError as exc:
+            return _coreml_backend_error_response(
+                exc,
+                cache_id=cache_id,
+                cache_mode=cache_mode,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{output_format}"',
             "X-Irodori-Requested-Format": requested_format,
+            "X-Irodori-Denoiser-Backend": denoiser_backend,
             "X-Irodori-Generation-Seconds": _format_seconds_header(segment_plan.total_seconds),
             "X-Irodori-Seconds-Mode": segment_plan.seconds_mode,
             "X-Irodori-Chunk-Count": str(len(segment_plan.segments)),
@@ -1386,6 +1499,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
             ),
             "X-Irodori-Num-Steps": str(int(num_steps)),
         }
+        if condition_cache_id_header is not None:
+            headers["X-Irodori-Condition-Cache-Id"] = condition_cache_id_header
         return Response(
             content=audio_bytes,
             media_type=_content_type(output_format),

@@ -17,9 +17,20 @@ from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
+from .coreml_cache import (
+    BRANCH_LAYOUT_COND1,
+    BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3,
+    STATE_LAYOUT_PER_LAYER,
+    ConditionCacheHandle,
+)
+from .coreml_stateful import (
+    CoreMLStatefulDenoiserBackend,
+    CoreMLStatefulUnavailableError,
+    pack_context_kv_state,
+)
 from .lora import checkpoint_state_uses_lora
 from .model import TextToLatentRFDiT
-from .rf import sample_euler_rf_cfg
+from .rf import _make_rng, sample_euler_rf_cfg, temporal_score_rescale
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 
@@ -209,6 +220,24 @@ class SamplingResult:
     total_to_decode: float
     used_seed: int
     messages: list[str]
+
+
+def _default_coreml_stateful_backend_factory(
+    runtime: InferenceRuntime,
+    *,
+    condition_cache: ConditionCacheHandle,
+    branch_layout: str,
+) -> CoreMLStatefulDenoiserBackend:
+    return CoreMLStatefulDenoiserBackend(
+        runtime.model,
+        sequence_length=int(condition_cache.sequence_length),
+        c_ctx_bucket=int(condition_cache.c_ctx_bucket),
+        branch_layout=branch_layout,
+        state_layout=condition_cache.state_layout,
+    )
+
+
+COREML_STATEFUL_BACKEND_FACTORY = _default_coreml_stateful_backend_factory
 
 
 def _maybe_compile_inference_model(
@@ -416,6 +445,7 @@ class InferenceRuntime:
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self._infer_lock = threading.Lock()
+        self._coreml_stateful_backends: dict[tuple[int, int, str, str], object] = {}
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -599,6 +629,491 @@ class InferenceRuntime:
             (batch_size, ref_latent_patched.shape[1]), dtype=torch.bool, device=self.model_device
         )
         return ref_latent_patched, ref_mask
+
+    def _get_coreml_stateful_backend(
+        self,
+        *,
+        condition_cache: ConditionCacheHandle,
+        branch_layout: str,
+    ) -> object:
+        key = (
+            int(condition_cache.sequence_length),
+            int(condition_cache.c_ctx_bucket),
+            str(condition_cache.state_layout),
+            str(branch_layout),
+        )
+        backend = self._coreml_stateful_backends.get(key)
+        if backend is None:
+            backend = COREML_STATEFUL_BACKEND_FACTORY(
+                self,
+                condition_cache=condition_cache,
+                branch_layout=branch_layout,
+            )
+            self._coreml_stateful_backends[key] = backend
+        return backend
+
+    def synthesize_with_condition_cache(
+        self,
+        req: SamplingRequest,
+        *,
+        condition_cache: ConditionCacheHandle,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> SamplingResult:
+        def _log(msg: str) -> None:
+            if log_fn is not None:
+                log_fn(msg)
+
+        self._validate_coreml_stateful_surface(req, condition_cache=condition_cache)
+        messages: list[str] = []
+        _log(
+            (
+                "[runtime] start synthesize_with_condition_cache "
+                "backend=coreml-stateful model_device={} model_precision={} "
+                "codec_device={} codec_precision={} seconds={} steps={} seed={}"
+            ).format(
+                self.key.model_device,
+                self.key.model_precision,
+                self.key.codec_device,
+                self.key.codec_precision,
+                req.seconds,
+                req.num_steps,
+                "random" if req.seed is None else int(req.seed),
+            )
+        )
+
+        if req.seconds <= 0:
+            raise ValueError(f"seconds must be > 0, got {req.seconds}")
+        num_candidates = int(req.num_candidates)
+        if num_candidates != 1:
+            raise CoreMLStatefulUnavailableError(
+                f"CoreML stateful fast path supports num_candidates=1, got {num_candidates}"
+            )
+        decode_mode = str(req.decode_mode).strip().lower()
+        if decode_mode not in {"sequential", "batch"}:
+            raise ValueError(
+                f"Unsupported decode_mode={req.decode_mode!r}. Expected one of: sequential, batch."
+            )
+
+        raw_text = str(req.text)
+        normalized_text = normalize_text(raw_text).strip()
+        if normalized_text == "":
+            raise ValueError("text became empty after normalization.")
+
+        text_max_len = int(condition_cache.text_len)
+        if req.max_text_len is not None and int(req.max_text_len) != text_max_len:
+            raise CoreMLStatefulUnavailableError(
+                "CoreML condition cache text_len does not match requested max_text_len"
+            )
+        caption_max_len = (
+            self.default_caption_max_len
+            if req.max_caption_len is None
+            else int(req.max_caption_len)
+        )
+        if self.model_cfg.use_caption_condition and caption_max_len <= 0:
+            raise ValueError(f"max_caption_len must be > 0, got {caption_max_len}")
+        has_caption_text = bool(
+            self.model_cfg.use_caption_condition
+            and req.caption is not None
+            and str(req.caption).strip() != ""
+        )
+
+        truncation_factor = None if req.truncation_factor is None else float(req.truncation_factor)
+        rescale_k = None if req.rescale_k is None else float(req.rescale_k)
+        rescale_sigma = None if req.rescale_sigma is None else float(req.rescale_sigma)
+        if truncation_factor is not None and truncation_factor <= 0:
+            raise ValueError(f"truncation_factor must be > 0, got {truncation_factor}")
+        if (rescale_k is None) != (rescale_sigma is None):
+            raise ValueError("rescale_k and rescale_sigma must be set together.")
+        if rescale_k is not None and rescale_k <= 0:
+            raise ValueError(f"rescale_k must be > 0, got {rescale_k}")
+        if rescale_sigma is not None and rescale_sigma <= 0:
+            raise ValueError(f"rescale_sigma must be > 0, got {rescale_sigma}")
+        if req.speaker_kv_scale is not None:
+            raise CoreMLStatefulUnavailableError(
+                "speaker_kv_scale is not supported by the CoreML stateful fast path"
+            )
+
+        cfg_mode = str(req.cfg_guidance_mode).strip().lower()
+        if cfg_mode != "independent":
+            raise CoreMLStatefulUnavailableError(
+                f"CoreML stateful fast path supports independent CFG only, got {cfg_mode!r}"
+            )
+        cfg_min_t = float(req.cfg_min_t)
+        cfg_max_t = float(req.cfg_max_t)
+        if not (0.0 <= cfg_min_t <= cfg_max_t <= 1.0):
+            raise ValueError("cfg_min_t/cfg_max_t must satisfy 0.0 <= min <= max <= 1.0")
+
+        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
+            cfg_guidance_mode=cfg_mode,
+            cfg_scale_text=req.cfg_scale_text,
+            cfg_scale_caption=req.cfg_scale_caption,
+            cfg_scale_speaker=req.cfg_scale_speaker,
+            cfg_scale=req.cfg_scale,
+            use_caption_condition=has_caption_text,
+            use_speaker_condition=self.model_cfg.use_speaker_condition,
+        )
+        messages.extend(scale_messages)
+        for msg in scale_messages:
+            _log(msg)
+        if has_caption_text and cfg_scale_caption > 0.0:
+            raise CoreMLStatefulUnavailableError(
+                "caption CFG is not supported by the CoreML stateful fast path"
+            )
+
+        branch_layouts = tuple(condition_cache.branch_layouts)
+        active_cfg_requested = bool(
+            cfg_scale_text > 0.0
+            or cfg_scale_speaker > 0.0
+            or (has_caption_text and cfg_scale_caption > 0.0)
+        )
+        if active_cfg_requested and BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3 not in branch_layouts:
+            raise CoreMLStatefulUnavailableError(
+                "active independent CFG requires independent_text_speaker3 CoreML state"
+            )
+
+        stage_timings: list[tuple[str, float]] = []
+        if req.seed is None:
+            used_seed = int(secrets.randbits(63))
+            msg = f"info: seed not specified; using random seed {used_seed}."
+            messages.append(msg)
+            _log(msg)
+        else:
+            used_seed = int(req.seed)
+            _log(f"[runtime] using seed: {used_seed}")
+        post_load_t0 = _measure_start(self.model_device, self.codec_device)
+
+        with self._infer_lock, torch.inference_mode():
+            t0 = _measure_start(self.model_device)
+            text_ids, text_mask = self.tokenizer.batch_encode(
+                [normalized_text],
+                max_length=text_max_len,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("tokenize_text", stage_sec))
+            _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
+            text_ids = text_ids.to(self.model_device)
+            text_mask = text_mask.to(self.model_device)
+
+            target_samples = int(float(req.seconds) * self.codec.sample_rate)
+            latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
+            patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
+            bucket_steps = int(condition_cache.sequence_length)
+            if patched_steps > bucket_steps:
+                raise CoreMLStatefulUnavailableError(
+                    "requested patched_steps "
+                    f"{patched_steps} exceeds CoreML condition cache bucket {bucket_steps}"
+                )
+
+            t0 = _measure_start(self.model_device, self.codec_device)
+            msg_count_before_ref = len(messages)
+            ref_latent, ref_mask = self._load_reference_latent(
+                req=req,
+                batch_size=1,
+                messages=messages,
+            )
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_timings.append(("prepare_reference", stage_sec))
+            for msg in messages[msg_count_before_ref:]:
+                _log(msg)
+            _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+
+            t0 = _measure_start(self.model_device)
+            z_patched = self._sample_coreml_stateful_rf_cfg(
+                condition_cache=condition_cache,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                sequence_length=bucket_steps,
+                actual_sequence_length=patched_steps,
+                num_steps=int(req.num_steps),
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_speaker=cfg_scale_speaker,
+                cfg_min_t=cfg_min_t,
+                cfg_max_t=cfg_max_t,
+                seed=used_seed,
+                truncation_factor=truncation_factor,
+                rescale_k=rescale_k,
+                rescale_sigma=rescale_sigma,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("sample_rf_coreml_stateful", stage_sec))
+            _log(f"[runtime] sample_rf_coreml_stateful: {stage_sec * 1000.0:.1f} ms")
+
+            t0 = _measure_start(self.model_device)
+            z = unpatchify_latent(
+                z_patched,
+                patch_size=self.model_cfg.latent_patch_size,
+                latent_dim=self.model_cfg.latent_dim,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("unpatchify_latent", stage_sec))
+            _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
+            z = z[:, :latent_steps]
+
+            t0 = _measure_start(self.model_device, self.codec_device)
+            trimmed_audios: list[torch.Tensor] = []
+            if decode_mode == "batch":
+                audio_batch = self.codec.decode_latent(z).cpu()
+                for i in range(num_candidates):
+                    audio_i = audio_batch[i]
+                    max_samples = self._trimmed_sample_count(req, z[i], target_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
+            else:
+                for i in range(num_candidates):
+                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    max_samples = self._trimmed_sample_count(req, z[i], target_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_timings.append(("decode_latent", stage_sec))
+            _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
+
+            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+            _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
+
+        _log("[runtime] done synthesize_with_condition_cache")
+        return SamplingResult(
+            audio=trimmed_audios[0],
+            audios=trimmed_audios,
+            sample_rate=int(self.codec.sample_rate),
+            stage_timings=stage_timings,
+            total_to_decode=total_to_decode,
+            used_seed=used_seed,
+            messages=messages,
+        )
+
+    def _validate_coreml_stateful_surface(
+        self,
+        req: SamplingRequest,
+        *,
+        condition_cache: ConditionCacheHandle,
+    ) -> None:
+        if not isinstance(condition_cache, ConditionCacheHandle):
+            raise CoreMLStatefulUnavailableError("condition_cache must be a ConditionCacheHandle")
+        if int(req.num_candidates) != 1:
+            raise CoreMLStatefulUnavailableError(
+                f"CoreML stateful fast path supports num_candidates=1, got {req.num_candidates}"
+            )
+        if condition_cache.state_layout != STATE_LAYOUT_PER_LAYER:
+            raise CoreMLStatefulUnavailableError(
+                f"unsupported CoreML state layout: {condition_cache.state_layout}"
+            )
+        branch_layouts = tuple(condition_cache.branch_layouts)
+        if branch_layouts not in {
+            (BRANCH_LAYOUT_COND1,),
+            (BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3),
+        }:
+            raise CoreMLStatefulUnavailableError(
+                f"unsupported CoreML branch layouts: {branch_layouts}"
+            )
+        if self.model_cfg.use_caption_condition:
+            raise CoreMLStatefulUnavailableError(
+                "caption-conditioned checkpoints are not supported by the CoreML stateful fast path"
+            )
+        if not self.model_cfg.use_speaker_condition:
+            raise CoreMLStatefulUnavailableError(
+                "speaker-conditioned checkpoints are required by the CoreML stateful fast path"
+            )
+        cfg_mode = str(req.cfg_guidance_mode).strip().lower()
+        if cfg_mode in {"joint", "alternating"}:
+            raise CoreMLStatefulUnavailableError(
+                f"cfg_guidance_mode={cfg_mode!r} is not supported by the CoreML stateful fast path"
+            )
+
+    def _sample_coreml_stateful_rf_cfg(
+        self,
+        *,
+        condition_cache: ConditionCacheHandle,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        ref_latent: torch.Tensor | None,
+        ref_mask: torch.Tensor | None,
+        sequence_length: int,
+        actual_sequence_length: int,
+        num_steps: int,
+        cfg_scale_text: float,
+        cfg_scale_speaker: float,
+        cfg_min_t: float,
+        cfg_max_t: float,
+        seed: int,
+        truncation_factor: float | None,
+        rescale_k: float | None,
+        rescale_sigma: float | None,
+    ) -> torch.Tensor:
+        device = self.model_device
+        dtype = next(self.model.parameters()).dtype
+        latent_dim = int(self.model_cfg.patched_latent_dim)
+        rng, rng_device = _make_rng(seed=seed, device=device)
+        x_t = torch.randn(
+            (1, int(sequence_length), latent_dim),
+            device=rng_device,
+            dtype=dtype,
+            generator=rng,
+        )
+        if rng_device != device:
+            x_t = x_t.to(device=device)
+        if truncation_factor is not None:
+            x_t = x_t * float(truncation_factor)
+
+        latent_mask = torch.zeros((1, int(sequence_length)), dtype=torch.bool, device=device)
+        latent_mask[:, : int(actual_sequence_length)] = True
+        t_schedule = torch.linspace(1.0, 0.0, int(num_steps) + 1, device=device) * 0.999
+
+        (
+            text_state_cond,
+            text_mask_cond,
+            speaker_state_cond,
+            speaker_mask_cond,
+            caption_state_cond,
+            _caption_mask_cond,
+        ) = self.model.encode_conditions(
+            text_input_ids=text_ids,
+            text_mask=text_mask,
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            caption_input_ids=None,
+            caption_mask=None,
+        )
+        if caption_state_cond is not None:
+            raise CoreMLStatefulUnavailableError(
+                "caption state is not supported by the CoreML stateful fast path"
+            )
+        if speaker_state_cond is None or speaker_mask_cond is None:
+            raise CoreMLStatefulUnavailableError(
+                "speaker state is required by the CoreML stateful fast path"
+            )
+
+        context_kv_cond = self.model.build_context_kv_cache(
+            text_state=text_state_cond,
+            speaker_state=speaker_state_cond,
+            caption_state=None,
+        )
+        payload_cond = pack_context_kv_state(
+            context_kv_cond,
+            text_mask=text_mask_cond,
+            speaker_mask=speaker_mask_cond,
+            speaker_context_bucket=int(condition_cache.speaker_context_len_bucket),
+            branch_layout=BRANCH_LAYOUT_COND1,
+        )
+        backend_cond = self._get_coreml_stateful_backend(
+            condition_cache=condition_cache,
+            branch_layout=BRANCH_LAYOUT_COND1,
+        )
+        state_cond = backend_cond.prepare_state(payload_cond)
+
+        branch_layouts = tuple(condition_cache.branch_layouts)
+        state_text_uncond = None
+        state_speaker_uncond = None
+        use_split_cfg_states = BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3 in branch_layouts and (
+            cfg_scale_text > 0.0 or cfg_scale_speaker > 0.0
+        )
+        if use_split_cfg_states:
+            text_state_uncond = torch.zeros_like(text_state_cond)
+            text_mask_uncond = torch.zeros_like(text_mask_cond)
+            speaker_state_uncond = torch.zeros_like(speaker_state_cond)
+            speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
+
+            context_kv_text_uncond = self.model.build_context_kv_cache(
+                text_state=text_state_uncond,
+                speaker_state=speaker_state_cond,
+                caption_state=None,
+            )
+            payload_text_uncond = pack_context_kv_state(
+                context_kv_text_uncond,
+                text_mask=text_mask_uncond,
+                speaker_mask=speaker_mask_cond,
+                speaker_context_bucket=int(condition_cache.speaker_context_len_bucket),
+                branch_layout=BRANCH_LAYOUT_COND1,
+            )
+            state_text_uncond = backend_cond.prepare_state(payload_text_uncond)
+
+            context_kv_speaker_uncond = self.model.build_context_kv_cache(
+                text_state=text_state_cond,
+                speaker_state=speaker_state_uncond,
+                caption_state=None,
+            )
+            payload_speaker_uncond = pack_context_kv_state(
+                context_kv_speaker_uncond,
+                text_mask=text_mask_cond,
+                speaker_mask=speaker_mask_uncond,
+                speaker_context_bucket=int(condition_cache.speaker_context_len_bucket),
+                branch_layout=BRANCH_LAYOUT_COND1,
+            )
+            state_speaker_uncond = backend_cond.prepare_state(payload_speaker_uncond)
+
+        for i in range(int(num_steps)):
+            t = t_schedule[i]
+            t_next = t_schedule[i + 1]
+            tt = torch.full((1,), t, device=device, dtype=dtype)
+            use_cfg = bool(cfg_scale_text > 0.0 or cfg_scale_speaker > 0.0) and (
+                float(cfg_min_t) <= float(t.item()) <= float(cfg_max_t)
+            )
+            if use_cfg:
+                if state_text_uncond is None or state_speaker_uncond is None:
+                    raise CoreMLStatefulUnavailableError(
+                        "active CFG requires independent_text_speaker3 CoreML state"
+                    )
+                cond = backend_cond.predict_step(
+                    state_cond,
+                    x_t=x_t,
+                    t=tt,
+                    latent_mask=latent_mask,
+                )
+                text_uncond = backend_cond.predict_step(
+                    state_text_uncond,
+                    x_t=x_t,
+                    t=tt,
+                    latent_mask=latent_mask,
+                )
+                speaker_uncond = backend_cond.predict_step(
+                    state_speaker_uncond,
+                    x_t=x_t,
+                    t=tt,
+                    latent_mask=latent_mask,
+                )
+                v = (
+                    cond
+                    + float(cfg_scale_text) * (cond - text_uncond)
+                    + float(cfg_scale_speaker) * (cond - speaker_uncond)
+                )
+            else:
+                v = backend_cond.predict_step(
+                    state_cond,
+                    x_t=x_t,
+                    t=tt,
+                    latent_mask=latent_mask,
+                )
+
+            if rescale_k is not None and rescale_sigma is not None:
+                v = temporal_score_rescale(
+                    v_pred=v,
+                    x_t=x_t,
+                    t=t,
+                    rescale_k=float(rescale_k),
+                    rescale_sigma=float(rescale_sigma),
+                )
+            x_t = x_t + v * (t_next - t)
+
+        return x_t[:, : int(actual_sequence_length)]
+
+    def _trimmed_sample_count(
+        self,
+        req: SamplingRequest,
+        z: torch.Tensor,
+        target_samples: int,
+    ) -> int:
+        max_samples = target_samples
+        if bool(req.trim_tail):
+            flattening_point = find_flattening_point(
+                z,
+                window_size=max(1, int(req.tail_window_size)),
+                std_threshold=float(req.tail_std_threshold),
+                mean_threshold=float(req.tail_mean_threshold),
+            )
+            flattening_samples = int(flattening_point * int(self.codec.model.hop_length))
+            if flattening_samples > 0:
+                max_samples = min(max_samples, flattening_samples)
+        return max_samples
 
     def synthesize(
         self,

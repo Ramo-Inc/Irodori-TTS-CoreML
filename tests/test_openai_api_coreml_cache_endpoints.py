@@ -289,6 +289,7 @@ def test_cond_only_condition_cache_uses_single_branch(client: TestClient) -> Non
             "reference_cache_id": reference["id"],
             "input": "single branch",
             "cfg": {"mode": "cond"},
+            "branch_layouts": ["cond1"],
         },
     )
 
@@ -296,6 +297,24 @@ def test_cond_only_condition_cache_uses_single_branch(client: TestClient) -> Non
     condition = response.json()
     assert condition["bucket_id"] == "S100_T256_R160_cond1"
     assert condition["shapes"]["branches_active"] == 1
+
+
+def test_independent_condition_cache_rejects_cond_only_branch_layout(
+    client: TestClient,
+) -> None:
+    reference = create_reference_cache(client)
+
+    response = client.post(
+        "/v1/tts/condition-caches",
+        json={
+            "reference_cache_id": reference["id"],
+            "input": "invalid branch layout",
+            "cfg": {"mode": "independent"},
+            "branch_layouts": ["cond1"],
+        },
+    )
+
+    assert_cache_error(response, 400, "cache_validation_error")
 
 
 def test_condition_cache_omitted_cfg_reuses_explicit_cond_cfg(client: TestClient) -> None:

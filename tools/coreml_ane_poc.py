@@ -242,14 +242,10 @@ class IrodoriLikeAttention(nn.Module):
         k_self = self.wk(x).reshape(1, self.seq_len, self.heads, self.head_dim).transpose(1, 2)
         v_self = self.wv(x).reshape(1, self.seq_len, self.heads, self.head_dim).transpose(1, 2)
         k_text = (
-            self.wk_text(text)
-            .reshape(1, self.text_len, self.heads, self.head_dim)
-            .transpose(1, 2)
+            self.wk_text(text).reshape(1, self.text_len, self.heads, self.head_dim).transpose(1, 2)
         )
         v_text = (
-            self.wv_text(text)
-            .reshape(1, self.text_len, self.heads, self.head_dim)
-            .transpose(1, 2)
+            self.wv_text(text).reshape(1, self.text_len, self.heads, self.head_dim).transpose(1, 2)
         )
 
         k = torch.cat((k_self, k_text), dim=2)
@@ -395,9 +391,9 @@ def _coreml_step_and_inputs() -> tuple[CoreMLCompatibleDenoiserStep, tuple[torch
         dtype=torch.float32,
     )
     cond_in = torch.linspace(-0.35, 0.35, CoreMLCompatibleDenoiserStep.dim).reshape(1, -1)
-    text_state = torch.linspace(-0.20, 0.55, CoreMLCompatibleDenoiserStep.text_len * CoreMLCompatibleDenoiserStep.dim).reshape(
-        1, CoreMLCompatibleDenoiserStep.text_len, CoreMLCompatibleDenoiserStep.dim
-    )
+    text_state = torch.linspace(
+        -0.20, 0.55, CoreMLCompatibleDenoiserStep.text_len * CoreMLCompatibleDenoiserStep.dim
+    ).reshape(1, CoreMLCompatibleDenoiserStep.text_len, CoreMLCompatibleDenoiserStep.dim)
     latent_mask = torch.tensor([[1.0, 1.0, 0.0]], dtype=torch.float32)
     text_mask = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
     return model, (x_t, cond_in, text_state, latent_mask, text_mask)
@@ -654,10 +650,7 @@ def main() -> int:
         for result in results
         if not (
             result.status == "SKIP"
-            and (
-                result.compute_unit == "CPU_AND_NE"
-                or result.name.startswith("Probe D")
-            )
+            and (result.compute_unit == "CPU_AND_NE" or result.name.startswith("Probe D"))
         )
     ]
     return 0 if all(result.passed for result in required) else 1

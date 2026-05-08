@@ -32,10 +32,25 @@ CAPTION = "neutral"
 class FakeRuntime:
     def __init__(self) -> None:
         self.requests: list[Any] = []
+        self.fast_requests: list[tuple[Any, Any]] = []
 
     def synthesize(self, request: Any, log_fn: Any = None) -> SimpleNamespace:
         del log_fn
         self.requests.append(request)
+        return SimpleNamespace(
+            audio=torch.zeros((1, 8), dtype=torch.float32),
+            sample_rate=16_000,
+        )
+
+    def synthesize_with_condition_cache(
+        self,
+        request: Any,
+        *,
+        condition_cache: Any,
+        log_fn: Any = None,
+    ) -> SimpleNamespace:
+        del log_fn
+        self.fast_requests.append((request, condition_cache))
         return SimpleNamespace(
             audio=torch.zeros((1, 8), dtype=torch.float32),
             sample_rate=16_000,
@@ -153,6 +168,7 @@ def create_matching_condition_cache(
 def assert_legacy_pcm_success(response: Any) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "audio/L16"
+    assert response.headers["X-Irodori-Denoiser-Backend"] == "pytorch"
     assert response.content == b"\x00" * 16
 
 
@@ -267,7 +283,7 @@ def test_require_rejects_condition_built_for_different_reference_before_runtime(
     assert runtime.requests == []
 
 
-def test_require_with_matching_condition_cache_falls_through_to_legacy_runtime(
+def test_require_with_matching_condition_cache_uses_fast_path(
     client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
 ) -> None:
     client, runtime, calls = client_runtime
@@ -280,9 +296,14 @@ def test_require_with_matching_condition_cache_falls_through_to_legacy_runtime(
         ),
     )
 
-    assert_legacy_pcm_success(response)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/L16"
+    assert response.headers["X-Irodori-Denoiser-Backend"] == "coreml-stateful"
+    assert response.headers["X-Irodori-Condition-Cache-Id"] == condition["id"]
+    assert response.content == b"\x00" * 16
     assert calls["get_runtime"] == 1
-    assert len(runtime.requests) == 1
+    assert runtime.requests == []
+    assert len(runtime.fast_requests) == 1
 
 
 def test_auto_without_cache_id_falls_back_to_legacy_runtime(

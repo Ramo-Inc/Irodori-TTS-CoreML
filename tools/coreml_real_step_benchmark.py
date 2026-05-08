@@ -95,7 +95,9 @@ def default_text_max_len(train_cfg: dict | None) -> int:
     return 256
 
 
-def load_actual_model(checkpoint_path: Path, device: torch.device) -> tuple[TextToLatentRFDiT, ModelConfig, dict | None]:
+def load_actual_model(
+    checkpoint_path: Path, device: torch.device
+) -> tuple[TextToLatentRFDiT, ModelConfig, dict | None]:
     model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(checkpoint_path)
     model_cfg = ModelConfig(**model_cfg_dict)
     model = TextToLatentRFDiT(model_cfg)
@@ -123,7 +125,9 @@ def build_rope_cache(
     return torch.cos(freqs).reshape(shape).to(dtype), torch.sin(freqs).reshape(shape).to(dtype)
 
 
-def apply_real_rope(x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor) -> torch.Tensor:
+def apply_real_rope(
+    x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+) -> torch.Tensor:
     head_dim = x.shape[-1]
     x_pairs = x.reshape(*x.shape[:-1], head_dim // 2, 2)
     x0 = x_pairs[..., 0]
@@ -240,12 +244,8 @@ class RealCoreMLDenoiserStep(nn.Module):
         bsz = text_state.shape[0]
         text_len = text_state.shape[1]
         speaker_len = speaker_state.shape[1]
-        k_text = attention.wk_text(text_state).reshape(
-            bsz, text_len, self.heads, self.head_dim
-        )
-        v_text = attention.wv_text(text_state).reshape(
-            bsz, text_len, self.heads, self.head_dim
-        )
+        k_text = attention.wk_text(text_state).reshape(bsz, text_len, self.heads, self.head_dim)
+        v_text = attention.wv_text(text_state).reshape(bsz, text_len, self.heads, self.head_dim)
         k_speaker = attention.wk_speaker(speaker_state).reshape(
             bsz, speaker_len, self.heads, self.head_dim
         )
@@ -579,7 +579,9 @@ def prepare_real_inputs(
             ref_mask=ref_mask,
         )
     if caption_state is not None or caption_mask is not None:
-        raise NotImplementedError("Caption-conditioned checkpoints are not supported by this benchmark.")
+        raise NotImplementedError(
+            "Caption-conditioned checkpoints are not supported by this benchmark."
+        )
     if speaker_state is None or speaker_mask is None:
         raise RuntimeError("Speaker-conditioned DEFAULT_CHECKPOINT did not produce speaker state.")
 
@@ -616,7 +618,9 @@ def prepare_real_inputs(
     ), metadata
 
 
-def cpu_coreml_inputs(inputs: tuple[torch.Tensor, ...]) -> tuple[tuple[torch.Tensor, ...], dict[str, np.ndarray]]:
+def cpu_coreml_inputs(
+    inputs: tuple[torch.Tensor, ...],
+) -> tuple[tuple[torch.Tensor, ...], dict[str, np.ndarray]]:
     x_t, t, text_state, text_mask, speaker_state, speaker_mask, latent_mask = inputs
     cpu_inputs = (
         x_t.detach().cpu(),
@@ -774,7 +778,9 @@ def main(argv: list[str] | None = None) -> int:
     if platform.system() != "Darwin":
         raise RuntimeError("Core ML prediction and PyTorch MPS baseline require macOS.")
     if not torch.backends.mps.is_available():
-        raise RuntimeError("PyTorch MPS baseline requested but torch.backends.mps.is_available() is False.")
+        raise RuntimeError(
+            "PyTorch MPS baseline requested but torch.backends.mps.is_available() is False."
+        )
 
     mps_device = torch.device("mps")
     checkpoint_path = resolve_checkpoint_path(args.checkpoint)
@@ -786,7 +792,10 @@ def main(argv: list[str] | None = None) -> int:
     print("[load] actual checkpoint/model weights on MPS", flush=True)
     model, model_cfg, train_cfg = load_actual_model(checkpoint_path, mps_device)
 
-    print("[prepare] tokenizer, codec-derived length, rem.wav reference, encoded conditions", flush=True)
+    print(
+        "[prepare] tokenizer, codec-derived length, rem.wav reference, encoded conditions",
+        flush=True,
+    )
     inputs_mps, metadata = prepare_real_inputs(
         model=model,
         model_cfg=model_cfg,
@@ -833,13 +842,15 @@ def main(argv: list[str] | None = None) -> int:
             compute_precision=compute_precision,
             verbose=bool(args.verbose_convert),
         )
-        print(f"[convert] Core ML mlprogram CPU_AND_NE conversion: {convert_seconds:.3f} s", flush=True)
+        print(
+            f"[convert] Core ML mlprogram CPU_AND_NE conversion: {convert_seconds:.3f} s",
+            flush=True,
+        )
 
         compute_unit = ct.ComputeUnit.CPU_AND_NE
         ne_preferred_counts = compute_plan_counts(ct, mlmodel, compute_unit)
         print(
-            "[compute_plan] "
-            + json.dumps(ne_preferred_counts, ensure_ascii=False, sort_keys=True),
+            "[compute_plan] " + json.dumps(ne_preferred_counts, ensure_ascii=False, sort_keys=True),
             flush=True,
         )
 

@@ -11,7 +11,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from irodori_tts.config import ModelConfig  # noqa: E402
-from irodori_tts.model import TextToLatentRFDiT, apply_rotary_emb, precompute_freqs_cis  # noqa: E402
+from irodori_tts.model import (  # noqa: E402
+    TextToLatentRFDiT,
+    apply_rotary_emb,
+    precompute_freqs_cis,
+)
 from tools import coreml_real_step_benchmark as bench  # noqa: E402
 
 
