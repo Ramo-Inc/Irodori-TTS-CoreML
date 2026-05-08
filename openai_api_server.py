@@ -20,6 +20,10 @@ from huggingface_hub import hf_hub_download
 from irodori_tts.coreml_cache import (
     BRANCH_LAYOUT_COND1,
     BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3,
+    CACHE_MODE_AUTO,
+    CACHE_MODE_OFF,
+    CACHE_MODE_PREPARE,
+    CACHE_MODE_REQUIRE,
     CacheConflictError,
     CacheExpiredError,
     CacheNotFoundError,
@@ -31,6 +35,7 @@ from irodori_tts.coreml_cache import (
     cache_create_status_code,
     cache_exception_to_http_error,
     condition_cache_response,
+    normalize_speech_cache_mode,
     reference_cache_response,
 )
 from irodori_tts.inference_runtime import (
@@ -186,8 +191,17 @@ def _require_object(payload: Any) -> dict[str, Any]:
     return payload
 
 
-def _cache_error_response(exc: Exception) -> JSONResponse:
-    error = cache_exception_to_http_error(exc)
+def _cache_error_response(
+    exc: Exception,
+    *,
+    cache_id: str | None = None,
+    cache_mode: str | None = None,
+) -> JSONResponse:
+    error = cache_exception_to_http_error(
+        exc,
+        cache_id=cache_id,
+        cache_mode=cache_mode,
+    )
     return JSONResponse(status_code=error.status_code, content=error.payload)
 
 
@@ -594,6 +608,171 @@ def _condition_cache_request(
         ttl_seconds=_cache_ttl_seconds(payload),
         metadata=_cache_optional_metadata(payload),
     )
+
+
+def _speech_irodori_extension(payload: dict[str, Any]) -> dict[str, Any] | None:
+    value = payload.get("irodori", _MISSING)
+    if value is _MISSING:
+        return None
+    if not isinstance(value, dict):
+        raise CacheValidationError("irodori must be an object")
+    return value
+
+
+def _speech_cache_mode(irodori: dict[str, Any] | None) -> str:
+    if irodori is None:
+        return CACHE_MODE_OFF
+    return normalize_speech_cache_mode(irodori.get("cache_mode"))
+
+
+def _speech_cache_id(irodori: dict[str, Any] | None) -> str | None:
+    if irodori is None:
+        return None
+    value = irodori.get("cache_id", _MISSING)
+    if value is _MISSING or value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise CacheValidationError("irodori.cache_id must be a non-empty string")
+    return value.strip()
+
+
+def _speech_reference_cache_request(settings: ServerSettings) -> ReferenceCacheRequest:
+    return _reference_cache_request(
+        {"source": {"type": "server_default"}},
+        settings,
+    )
+
+
+def _raise_speech_reference_conflict(
+    field_name: str,
+    actual: object,
+    expected: object,
+) -> None:
+    if actual != expected:
+        raise CacheConflictError(f"{field_name} conflicts with server reference cache")
+
+
+def _validate_speech_reference_cache(
+    reference_handle: Any,
+    expected_request: ReferenceCacheRequest,
+) -> None:
+    _raise_speech_reference_conflict(
+        "model_fingerprint",
+        reference_handle.model_fingerprint,
+        expected_request.model_fingerprint,
+    )
+    _raise_speech_reference_conflict(
+        "codec_fingerprint",
+        reference_handle.codec_fingerprint,
+        expected_request.codec_fingerprint,
+    )
+    _raise_speech_reference_conflict(
+        "reference_fingerprint",
+        reference_handle.reference_fingerprint,
+        expected_request.reference_fingerprint,
+    )
+    _raise_speech_reference_conflict(
+        "speaker_context_len",
+        reference_handle.speaker_context_len,
+        expected_request.speaker_context_len,
+    )
+
+
+def _speech_condition_cache_request(
+    irodori: dict[str, Any],
+    settings: ServerSettings,
+    reference_cache_id: str,
+    speaker_context_len: int,
+    segment: SpeechSegment,
+    caption: str | None,
+) -> ConditionCacheRequest:
+    condition_payload = dict(irodori)
+    if "cfg" not in condition_payload:
+        condition_payload["cfg"] = {"mode": "independent"}
+
+    bucket = _condition_cache_bucket(condition_payload)
+    cfg = _condition_cfg(condition_payload)
+    return ConditionCacheRequest(
+        reference_cache_id=reference_cache_id,
+        model_fingerprint=str(
+            _cache_optional_text(
+                condition_payload,
+                "model_fingerprint",
+                f"model:{settings.checkpoint}",
+            ),
+        ),
+        tokenizer_fingerprint=str(
+            _cache_optional_text(
+                condition_payload,
+                "tokenizer_fingerprint",
+                "tokenizer:default",
+            ),
+        ),
+        condition_fingerprint=_condition_fingerprint(
+            condition_payload,
+            bucket,
+            cfg,
+            segment.text,
+            caption,
+            float(segment.seconds),
+        ),
+        bucket=bucket,
+        speaker_context_len=int(speaker_context_len),
+        branch_layouts=_condition_branch_layouts(condition_payload, cfg),
+    )
+
+
+def _validate_speech_cache_extension(
+    irodori: dict[str, Any] | None,
+    cache_mode: str,
+    cache_id: str | None,
+    segment_plan: SpeechSegmentPlan,
+    caption: str | None,
+    settings: ServerSettings,
+    cache_manager: InMemoryCoreMLCacheManager,
+) -> None:
+    if cache_mode == CACHE_MODE_OFF:
+        return
+    if cache_mode in {CACHE_MODE_PREPARE, CACHE_MODE_REFRESH}:
+        raise CacheValidationError(
+            f"cache_mode={cache_mode} is not supported for /v1/audio/speech",
+        )
+    if cache_mode == CACHE_MODE_REQUIRE and cache_id is None:
+        raise CacheValidationError("irodori.cache_id is required when cache_mode=require")
+    if cache_id is None:
+        return
+    if len(segment_plan.segments) != 1:
+        raise CacheConflictError("single cache_id cannot be used with multi-segment speech")
+
+    try:
+        condition_handle = cache_manager.peek_condition_cache(cache_id)
+    except (CacheExpiredError, CacheNotFoundError):
+        if cache_mode == CACHE_MODE_AUTO:
+            return
+        raise
+
+    try:
+        expected_reference_request = _speech_reference_cache_request(settings)
+        expected_reference_cache_id = cache_manager.reference_cache_id_for_request(
+            expected_reference_request,
+        )
+        reference_handle = cache_manager.peek_reference_cache(
+            condition_handle.reference_cache_id,
+        )
+        _validate_speech_reference_cache(reference_handle, expected_reference_request)
+        expected_request = _speech_condition_cache_request(
+            irodori or {},
+            settings,
+            expected_reference_cache_id,
+            expected_reference_request.speaker_context_len,
+            segment_plan.segments[0],
+            caption,
+        )
+        cache_manager.require_condition_cache(cache_id, expected_request)
+    except (CacheExpiredError, CacheNotFoundError):
+        if cache_mode == CACHE_MODE_AUTO:
+            return
+        raise
 
 
 def _required_text(payload: dict[str, Any], field: str) -> str:
@@ -1102,6 +1281,17 @@ def create_app(settings: ServerSettings) -> FastAPI:
     @app.post("/v1/audio/speech")
     async def audio_speech(payload: Any = Body(...)) -> Response:
         data = _require_object(payload)
+        irodori: dict[str, Any] | None = None
+        cache_mode: str | None = None
+        cache_id: str | None = None
+        try:
+            irodori = _speech_irodori_extension(data)
+            cache_mode = _speech_cache_mode(irodori)
+            if cache_mode != CACHE_MODE_OFF:
+                cache_id = _speech_cache_id(irodori)
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc, cache_id=cache_id, cache_mode=cache_mode)
+
         text = _required_text(data, "input")
         # Compatibility-only fields such as model, voice, and reference_audio are
         # deliberately ignored. Runtime selection and speaker reference are server-owned.
@@ -1123,6 +1313,18 @@ def create_app(settings: ServerSettings) -> FastAPI:
         seed = _optional_int(data, "seed", None)
         caption = _resolve_caption(data)
         segment_plan = _build_speech_segment_plan(data, text, settings)
+        try:
+            _validate_speech_cache_extension(
+                irodori,
+                str(cache_mode),
+                cache_id,
+                segment_plan,
+                caption,
+                settings,
+                cache_manager,
+            )
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc, cache_id=cache_id, cache_mode=cache_mode)
 
         if not settings.reference_wav.is_file():
             raise HTTPException(

@@ -188,6 +188,45 @@ def test_get_increments_hit_count_and_last_used_at() -> None:
     assert condition_hit.last_used_at == clock.current
 
 
+def test_peek_condition_cache_does_not_increment_hits_and_preserves_errors() -> None:
+    clock = Clock()
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=clock)
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    expiring_reference = manager.prepare_reference_cache(
+        reference_request(reference_fingerprint="reference-expiring", ttl_seconds=5),
+    ).handle
+    condition = manager.prepare_condition_cache(condition_request(reference.id)).handle
+    expiring_condition = manager.prepare_condition_cache(
+        condition_request(
+            reference.id,
+            condition_fingerprint="condition-expiring",
+            ttl_seconds=5,
+        ),
+    ).handle
+
+    clock.advance(1)
+    peeked_reference = manager.peek_reference_cache(reference.id)
+    peeked = manager.peek_condition_cache(condition.id)
+
+    assert peeked_reference is reference
+    assert reference.hit_count == 0
+    assert reference.last_used_at is None
+    assert peeked is condition
+    assert condition.hit_count == 0
+    assert condition.last_used_at is None
+
+    with pytest.raises(coreml_cache.CacheNotFoundError):
+        manager.peek_reference_cache("ref_missing")
+    with pytest.raises(coreml_cache.CacheNotFoundError):
+        manager.peek_condition_cache("cond_missing")
+
+    clock.advance(4)
+    with pytest.raises(coreml_cache.CacheExpiredError):
+        manager.peek_reference_cache(expiring_reference.id)
+    with pytest.raises(coreml_cache.CacheExpiredError):
+        manager.peek_condition_cache(expiring_condition.id)
+
+
 def test_require_condition_cache_matches_without_incrementing_hits() -> None:
     manager = coreml_cache.InMemoryCoreMLCacheManager(clock=Clock())
     reference = manager.prepare_reference_cache(reference_request()).handle

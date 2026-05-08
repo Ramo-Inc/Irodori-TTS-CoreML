@@ -848,6 +848,19 @@ class InMemoryCoreMLCacheManager:
         self._record_hit(handle, now)
         return handle
 
+    def peek_reference_cache(self, cache_id: str) -> ReferenceCacheHandle:
+        _validate_non_empty_string("cache_id", cache_id)
+        now = self._now()
+        handle = self._reference_caches.get(cache_id)
+        if handle is None:
+            raise CacheNotFoundError(f"reference cache not found: {cache_id}")
+        self._raise_if_expired(handle, now, "reference")
+        return handle
+
+    def reference_cache_id_for_request(self, request: ReferenceCacheRequest) -> str:
+        self._validate_reference_request(request)
+        return _reference_cache_id(request)
+
     def get_condition_cache(self, cache_id: str) -> ConditionCacheHandle:
         _validate_non_empty_string("cache_id", cache_id)
         now = self._now()
@@ -860,6 +873,19 @@ class InMemoryCoreMLCacheManager:
             raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
         self._raise_if_expired(reference, now, "reference")
         self._record_hit(handle, now)
+        return handle
+
+    def peek_condition_cache(self, cache_id: str) -> ConditionCacheHandle:
+        _validate_non_empty_string("cache_id", cache_id)
+        now = self._now()
+        handle = self._condition_caches.get(cache_id)
+        if handle is None:
+            raise CacheNotFoundError(f"condition cache not found: {cache_id}")
+        self._raise_if_expired(handle, now, "condition")
+        reference = self._reference_caches.get(handle.reference_cache_id)
+        if reference is None:
+            raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
+        self._raise_if_expired(reference, now, "reference")
         return handle
 
     def delete_reference_cache(self, cache_id: str, cascade: bool = True) -> bool:
