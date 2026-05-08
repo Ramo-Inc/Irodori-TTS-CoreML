@@ -30,10 +30,14 @@ def test_state_layout_normalization_and_cli_default() -> None:
     assert bench.normalize_state_layout("packed") == "packed_text_speaker_context_v1"
     assert bench.normalize_state_layout("per-layer") == "per_layer_text_speaker_context_v1"
     assert bench.normalize_state_layout("per_layer") == "per_layer_text_speaker_context_v1"
-    assert bench.state_layout_arg(bench.parse_args([])) == "packed_text_speaker_context_v1"
+    assert bench.state_layout_arg(bench.parse_args([])) == "per_layer_text_speaker_context_v1"
     assert (
         bench.state_layout_arg(bench.parse_args(["--state-layout", "per-layer"]))
         == "per_layer_text_speaker_context_v1"
+    )
+    assert (
+        bench.state_layout_arg(bench.parse_args(["--state-layout", "packed"]))
+        == "packed_text_speaker_context_v1"
     )
 
     with pytest.raises(ValueError, match="state_layout must be one of"):

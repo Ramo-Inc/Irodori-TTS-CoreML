@@ -35,7 +35,7 @@ DEFAULT_REF_WAV = real_bench.DEFAULT_REF_WAV
 MODE_COND_ONLY = "cond-only"
 STATE_LAYOUT_PACKED = "packed_text_speaker_context_v1"
 STATE_LAYOUT_PER_LAYER = "per_layer_text_speaker_context_v1"
-STATE_LAYOUT = STATE_LAYOUT_PACKED
+STATE_LAYOUT = STATE_LAYOUT_PER_LAYER
 NO_STATE_BASELINE_MS = 14.428
 STATE_READBACK_TOLERANCE = 1e-3
 REQUIRED_NORMALIZED_NE_OPS = ("linear", "matmul", "softmax")
@@ -72,7 +72,7 @@ def normalize_state_layout(state_layout: str) -> str:
 
 
 def state_layout_arg(args: argparse.Namespace) -> str:
-    return normalize_state_layout(getattr(args, "state_layout", STATE_LAYOUT_PACKED))
+    return normalize_state_layout(getattr(args, "state_layout", STATE_LAYOUT))
 
 
 def expected_state_names(
@@ -1155,7 +1155,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--state-layout",
         choices=("packed", "per-layer"),
-        default="packed",
+        default="per-layer",
         help="MLState layout for text+speaker context KV.",
     )
     parser.add_argument("--iterations", type=int, default=5)
