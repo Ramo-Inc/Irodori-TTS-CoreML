@@ -33,11 +33,23 @@ DEFAULT_CODEC_REPO = real_bench.DEFAULT_CODEC_REPO
 DEFAULT_TEXT = real_bench.DEFAULT_TEXT
 DEFAULT_REF_WAV = real_bench.DEFAULT_REF_WAV
 MODE_COND_ONLY = "cond-only"
-STATE_LAYOUT = "packed_text_speaker_context_v1"
+STATE_LAYOUT_PACKED = "packed_text_speaker_context_v1"
+STATE_LAYOUT_PER_LAYER = "per_layer_text_speaker_context_v1"
+STATE_LAYOUT = STATE_LAYOUT_PACKED
 NO_STATE_BASELINE_MS = 14.428
 STATE_READBACK_TOLERANCE = 1e-3
 REQUIRED_NORMALIZED_NE_OPS = ("linear", "matmul", "softmax")
-STATE_NAMES = ("context_k_state", "context_v_state", "valid_mask_state")
+PACKED_STATE_NAMES = ("context_k_state", "context_v_state", "valid_mask_state")
+STATE_NAMES = PACKED_STATE_NAMES
+STATE_LAYOUT_ALIASES = {
+    "packed": STATE_LAYOUT_PACKED,
+    STATE_LAYOUT_PACKED: STATE_LAYOUT_PACKED,
+    "per-layer": STATE_LAYOUT_PER_LAYER,
+    "per_layer": STATE_LAYOUT_PER_LAYER,
+    STATE_LAYOUT_PER_LAYER: STATE_LAYOUT_PER_LAYER,
+}
+LARGE_READ_STATE_BYTES_FP16 = 1_000_000
+GIANT_READ_STATE_BYTES_FP16 = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -49,6 +61,97 @@ class PackedContextState:
     speaker_context_len: int
     speaker_context_bucket: int
     c_ctx_bucket: int
+
+
+def normalize_state_layout(state_layout: str) -> str:
+    try:
+        return STATE_LAYOUT_ALIASES[str(state_layout).strip()]
+    except KeyError as exc:
+        allowed = "packed, per-layer"
+        raise ValueError(f"state_layout must be one of {allowed}, got {state_layout!r}") from exc
+
+
+def state_layout_arg(args: argparse.Namespace) -> str:
+    return normalize_state_layout(getattr(args, "state_layout", STATE_LAYOUT_PACKED))
+
+
+def expected_state_names(
+    state_layout: str = STATE_LAYOUT_PACKED,
+    *,
+    num_layers: int | None = None,
+) -> tuple[str, ...]:
+    normalized = normalize_state_layout(state_layout)
+    if normalized == STATE_LAYOUT_PACKED:
+        return PACKED_STATE_NAMES
+
+    if num_layers is None:
+        raise ValueError("num_layers is required for per-layer state layout expected state names")
+    layer_count = int(num_layers)
+    if layer_count <= 0:
+        raise ValueError(f"num_layers must be > 0, got {num_layers}")
+
+    names: list[str] = []
+    for layer_index in range(layer_count):
+        names.append(f"context_k_l{layer_index:02d}")
+        names.append(f"context_v_l{layer_index:02d}")
+    names.append("valid_mask_state")
+    return tuple(names)
+
+
+def state_payloads_from_packed(
+    packed: PackedContextState,
+    *,
+    state_layout: str = STATE_LAYOUT_PACKED,
+) -> dict[str, np.ndarray]:
+    normalized = normalize_state_layout(state_layout)
+    if normalized == STATE_LAYOUT_PACKED:
+        return {
+            "context_k_state": packed.context_k_state,
+            "context_v_state": packed.context_v_state,
+            "valid_mask_state": packed.valid_mask_state,
+        }
+
+    num_layers = int(packed.context_k_state.shape[0])
+    if int(packed.context_v_state.shape[0]) != num_layers:
+        raise ValueError(
+            "context_k_state/context_v_state layer count mismatch: "
+            f"{packed.context_k_state.shape[0]} vs {packed.context_v_state.shape[0]}"
+        )
+
+    payloads: dict[str, np.ndarray] = {}
+    for layer_index in range(num_layers):
+        payloads[f"context_k_l{layer_index:02d}"] = packed.context_k_state[layer_index]
+        payloads[f"context_v_l{layer_index:02d}"] = packed.context_v_state[layer_index]
+    payloads["valid_mask_state"] = packed.valid_mask_state
+    return payloads
+
+
+def state_payload_shapes(
+    packed: PackedContextState,
+    *,
+    state_layout: str = STATE_LAYOUT_PACKED,
+) -> dict[str, list[int]]:
+    return {
+        name: [int(dim) for dim in payload.shape]
+        for name, payload in state_payloads_from_packed(
+            packed,
+            state_layout=state_layout,
+        ).items()
+    }
+
+
+def state_write_payloads_from_packed(
+    packed: PackedContextState,
+    *,
+    state_layout: str = STATE_LAYOUT_PACKED,
+) -> dict[str, np.ndarray]:
+    return {
+        name: np.ascontiguousarray(payload.astype(np.float32))
+        for name, payload in state_payloads_from_packed(
+            packed,
+            state_layout=state_layout,
+        ).items()
+    }
 
 
 def first_line(exc: BaseException) -> str:
@@ -121,7 +224,9 @@ def _validate_layer_context_tuple(
     if any(len(shape) != 4 for shape in shapes):
         raise ValueError(f"context_kv layer {layer_index} tensors must be rank-4, got {shapes}")
     if k_text.shape != v_text.shape:
-        raise ValueError(f"text K/V shape mismatch at layer {layer_index}: {shapes[0]} vs {shapes[1]}")
+        raise ValueError(
+            f"text K/V shape mismatch at layer {layer_index}: {shapes[0]} vs {shapes[1]}"
+        )
     if k_speaker.shape != v_speaker.shape:
         raise ValueError(
             f"speaker K/V shape mismatch at layer {layer_index}: {shapes[2]} vs {shapes[3]}"
@@ -158,7 +263,9 @@ def pack_context_kv_state(
             f"speaker_context_len {speaker_len} exceeds speaker_context_bucket {speaker_context_bucket}"
         )
     if int(text_mask.shape[1]) != text_len:
-        raise ValueError(f"text_mask length {int(text_mask.shape[1])} does not match text_len {text_len}")
+        raise ValueError(
+            f"text_mask length {int(text_mask.shape[1])} does not match text_len {text_len}"
+        )
     if int(speaker_mask.shape[1]) != speaker_len:
         raise ValueError(
             f"speaker_mask length {int(speaker_mask.shape[1])} does not match speaker_context_len {speaker_len}"
@@ -246,9 +353,9 @@ def normalize_compute_plan_counts(raw_compute_plan_counts: dict[str, Any]) -> di
         preferred_devices = counts.get("preferred_devices", {})
         if isinstance(preferred_devices, dict):
             for device_name, value in preferred_devices.items():
-                dst["preferred_devices"][str(device_name)] = (
-                    int(dst["preferred_devices"].get(str(device_name), 0)) + int(value or 0)
-                )
+                dst["preferred_devices"][str(device_name)] = int(
+                    dst["preferred_devices"].get(str(device_name), 0)
+                ) + int(value or 0)
     return normalized
 
 
@@ -279,6 +386,15 @@ def _max_read_state_abs_diff(read_state_max_abs_diff: Any) -> float | None:
     return max(numeric) if numeric else None
 
 
+def _read_state_op_bytes_fp16(op: Any) -> int:
+    if not isinstance(op, dict):
+        return 0
+    try:
+        return int(op.get("bytes_fp16", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _summarize_large_read_state_ops(large_read_state_ops: Any) -> str:
     if not large_read_state_ops:
         return "large_read_state_ops=0"
@@ -293,11 +409,7 @@ def _summarize_large_read_state_ops(large_read_state_ops: Any) -> str:
     )
     total_bytes = 0
     for op in large_read_state_ops:
-        if isinstance(op, dict):
-            try:
-                total_bytes += int(op.get("bytes_fp16", 0) or 0)
-            except (TypeError, ValueError):
-                pass
+        total_bytes += _read_state_op_bytes_fp16(op)
     state_text = ",".join(states) if states else "unknown"
     return (
         f"large_read_state_ops={len(large_read_state_ops)} "
@@ -324,11 +436,13 @@ def _summarize_slice_placement(slice_placement_summary: Any) -> str:
 
 def _state_layout_hint(
     *,
+    state_layout: str,
     read_state_op_count: int | None,
     large_read_state_ops: Any,
     slice_placement_summary: Any,
 ) -> str:
     return (
+        f"state_layout={normalize_state_layout(state_layout)}; "
         f"read_state_op_count={read_state_op_count}; "
         f"{_summarize_large_read_state_ops(large_read_state_ops)}; "
         f"{_summarize_slice_placement(slice_placement_summary)}"
@@ -347,13 +461,17 @@ def evaluate_stateful_status(
     first_predict_ms: float | None,
     write_state_ms: float | None,
     read_state_op_count: int | None,
+    state_layout: str = STATE_LAYOUT_PACKED,
+    num_layers: int | None = None,
     read_state_error: Any = None,
     read_state_max_abs_diff: Any = None,
     large_read_state_ops: list[dict[str, Any]] | None = None,
     read_state_counts_by_state: dict[str, Any] | None = None,
+    expected_read_state_names: tuple[str, ...] | None = None,
     slice_placement_summary: Any = None,
     readback_tolerance: float = STATE_READBACK_TOLERANCE,
 ) -> tuple[str, list[str]]:
+    normalized_state_layout = normalize_state_layout(state_layout)
     fail_reasons: list[str] = []
     warn_reasons: list[str] = []
 
@@ -387,6 +505,7 @@ def evaluate_stateful_status(
             f"steady_predict_ms {steady_predict_ms:.6g} is not faster than "
             f"no-state baseline {NO_STATE_BASELINE_MS:.3f}; "
             + _state_layout_hint(
+                state_layout=normalized_state_layout,
                 read_state_op_count=read_state_op_count,
                 large_read_state_ops=large_read_state_ops,
                 slice_placement_summary=slice_placement_summary,
@@ -415,20 +534,41 @@ def evaluate_stateful_status(
         )
 
     large_read_state_ops = large_read_state_ops or []
-    if large_read_state_ops:
+    giant_read_state_ops = [
+        op
+        for op in large_read_state_ops
+        if _read_state_op_bytes_fp16(op) >= GIANT_READ_STATE_BYTES_FP16
+    ]
+    if normalized_state_layout == STATE_LAYOUT_PACKED and large_read_state_ops:
         warn_reasons.append(
             "packed state layout produced large read_state ops: "
             + _state_layout_hint(
+                state_layout=normalized_state_layout,
                 read_state_op_count=read_state_op_count,
                 large_read_state_ops=large_read_state_ops,
                 slice_placement_summary=slice_placement_summary,
             )
         )
+    elif normalized_state_layout == STATE_LAYOUT_PER_LAYER and giant_read_state_ops:
+        warn_reasons.append(
+            "per-layer state layout produced giant read_state ops: "
+            + _state_layout_hint(
+                state_layout=normalized_state_layout,
+                read_state_op_count=read_state_op_count,
+                large_read_state_ops=giant_read_state_ops,
+                slice_placement_summary=slice_placement_summary,
+            )
+        )
 
     if read_state_counts_by_state:
+        if expected_read_state_names is None:
+            expected_read_state_names = expected_state_names(
+                normalized_state_layout,
+                num_layers=num_layers,
+            )
         missing_states = [
             state_name
-            for state_name in STATE_NAMES
+            for state_name in expected_read_state_names
             if int(read_state_counts_by_state.get(state_name, 0) or 0) <= 0
         ]
         if missing_states:
@@ -525,8 +665,10 @@ class RealCoreMLStatefulDenoiserStep(nn.Module):
         sequence_length: int,
         num_layers: int,
         c_ctx_bucket: int,
+        state_layout: str = STATE_LAYOUT_PACKED,
     ):
         super().__init__()
+        normalized_state_layout = normalize_state_layout(state_layout)
         if model.cfg.use_caption_condition:
             raise NotImplementedError(
                 "P1a cond-only benchmark supports the speaker-conditioned default checkpoint only."
@@ -544,6 +686,7 @@ class RealCoreMLStatefulDenoiserStep(nn.Module):
         self.norm_eps = float(model.cfg.norm_eps)
         self.num_layers = int(num_layers)
         self.c_ctx_bucket = int(c_ctx_bucket)
+        self.state_layout = normalized_state_layout
 
         self.cond_module = model.cond_module
         self.in_proj = model.in_proj
@@ -565,23 +708,42 @@ class RealCoreMLStatefulDenoiserStep(nn.Module):
         self.register_buffer("rope_cos", rope_cos, persistent=False)
         self.register_buffer("rope_sin", rope_sin, persistent=False)
 
-        state_shape = (self.num_layers, 1, self.c_ctx_bucket, self.heads, self.head_dim)
-        self.register_buffer(
-            "context_k_state",
-            torch.zeros(state_shape, dtype=torch.float16),
-        )
-        self.register_buffer(
-            "context_v_state",
-            torch.zeros(state_shape, dtype=torch.float16),
-        )
+        if self.state_layout == STATE_LAYOUT_PACKED:
+            state_shape = (self.num_layers, 1, self.c_ctx_bucket, self.heads, self.head_dim)
+            self.register_buffer(
+                "context_k_state",
+                torch.zeros(state_shape, dtype=torch.float16),
+            )
+            self.register_buffer(
+                "context_v_state",
+                torch.zeros(state_shape, dtype=torch.float16),
+            )
+        else:
+            state_shape = (1, self.c_ctx_bucket, self.heads, self.head_dim)
+            for layer_index in range(self.num_layers):
+                self.register_buffer(
+                    f"context_k_l{layer_index:02d}",
+                    torch.zeros(state_shape, dtype=torch.float16),
+                )
+                self.register_buffer(
+                    f"context_v_l{layer_index:02d}",
+                    torch.zeros(state_shape, dtype=torch.float16),
+                )
         self.register_buffer(
             "valid_mask_state",
             torch.zeros((1, self.c_ctx_bucket), dtype=torch.float16),
         )
         self._assert_state_buffer_dtypes()
 
+    def state_buffer_names(self) -> tuple[str, ...]:
+        return expected_state_names(self.state_layout, num_layers=self.num_layers)
+
+    def iter_state_buffers(self) -> Iterator[tuple[str, torch.Tensor]]:
+        for name in self.state_buffer_names():
+            yield name, getattr(self, name)
+
     def _assert_state_buffer_dtypes(self) -> None:
-        for name in STATE_NAMES:
+        for name in self.state_buffer_names():
             value = getattr(self, name)
             if value.dtype != torch.float16:
                 raise TypeError(f"{name} must be registered as torch.float16, got {value.dtype}")
@@ -622,8 +784,12 @@ class RealCoreMLStatefulDenoiserStep(nn.Module):
         q = real_bench.apply_real_rope_half_heads(q, self.rope_cos, self.rope_sin)
         k_self = real_bench.apply_real_rope_half_heads(k_self, self.rope_cos, self.rope_sin)
 
-        context_k = self.context_k_state[layer_index].to(dtype=k_self.dtype)
-        context_v = self.context_v_state[layer_index].to(dtype=v_self.dtype)
+        if self.state_layout == STATE_LAYOUT_PACKED:
+            context_k = self.context_k_state[layer_index].to(dtype=k_self.dtype)
+            context_v = self.context_v_state[layer_index].to(dtype=v_self.dtype)
+        else:
+            context_k = getattr(self, f"context_k_l{layer_index:02d}").to(dtype=k_self.dtype)
+            context_v = getattr(self, f"context_v_l{layer_index:02d}").to(dtype=v_self.dtype)
         valid_mask = self.valid_mask_state.to(dtype=latent_mask_f.dtype)
 
         k = torch.cat((k_self, context_k), dim=1).transpose(1, 2)
@@ -715,17 +881,10 @@ def convert_wrapper(
     ]
     states = [
         ct.StateType(
-            wrapped_type=ct.TensorType(shape=tuple(wrapper.context_k_state.shape), dtype=np.float16),
-            name="context_k_state",
-        ),
-        ct.StateType(
-            wrapped_type=ct.TensorType(shape=tuple(wrapper.context_v_state.shape), dtype=np.float16),
-            name="context_v_state",
-        ),
-        ct.StateType(
-            wrapped_type=ct.TensorType(shape=tuple(wrapper.valid_mask_state.shape), dtype=np.float16),
-            name="valid_mask_state",
-        ),
+            wrapped_type=ct.TensorType(shape=tuple(buffer.shape), dtype=np.float16),
+            name=name,
+        )
+        for name, buffer in wrapper.iter_state_buffers()
     ]
     with torch.inference_mode():
         traced = torch.jit.trace(wrapper.eval(), trace_inputs, check_trace=False)
@@ -778,12 +937,14 @@ def mil_state_op_summary(mlmodel: Any) -> dict[str, Any]:
             "read_state_op_count": None,
             "read_state_counts_by_state": {},
             "large_read_state_ops": [],
+            "max_read_state_bytes_fp16": None,
             "error": f"{type(exc).__name__}: {first_line(exc)}",
         }
 
     read_state_count = 0
     counts_by_state: Counter[str] = Counter()
     large_read_state_ops: list[dict[str, Any]] = []
+    max_read_state_bytes_fp16 = 0
     for op in iter_mil_operations(main):
         if getattr(op, "op_type", None) != "read_state":
             continue
@@ -799,7 +960,8 @@ def mil_state_op_summary(mlmodel: Any) -> dict[str, Any]:
             if shape is not None:
                 numel = math.prod(shape)
                 bytes_fp16 = int(numel * 2)
-                if bytes_fp16 >= 1_000_000:
+                max_read_state_bytes_fp16 = max(max_read_state_bytes_fp16, bytes_fp16)
+                if bytes_fp16 >= LARGE_READ_STATE_BYTES_FP16:
                     large_read_state_ops.append(
                         {
                             "name": str(getattr(op, "name", "")),
@@ -813,6 +975,7 @@ def mil_state_op_summary(mlmodel: Any) -> dict[str, Any]:
         "read_state_op_count": int(read_state_count),
         "read_state_counts_by_state": dict(counts_by_state),
         "large_read_state_ops": large_read_state_ops,
+        "max_read_state_bytes_fp16": int(max_read_state_bytes_fp16),
     }
 
 
@@ -894,12 +1057,10 @@ def compute_plan_report(ct: Any, mlmodel: Any, compute_unit: Any) -> dict[str, A
 def make_and_write_state(
     mlmodel: Any,
     packed: PackedContextState,
+    *,
+    state_layout: str = STATE_LAYOUT_PACKED,
 ) -> tuple[Any, dict[str, Any]]:
-    state_payloads = {
-        "context_k_state": np.ascontiguousarray(packed.context_k_state.astype(np.float32)),
-        "context_v_state": np.ascontiguousarray(packed.context_v_state.astype(np.float32)),
-        "valid_mask_state": np.ascontiguousarray(packed.valid_mask_state.astype(np.float32)),
-    }
+    state_payloads = state_write_payloads_from_packed(packed, state_layout=state_layout)
 
     start = time.perf_counter()
     state = mlmodel.make_state()
@@ -956,7 +1117,11 @@ def benchmark_coreml_stateful_predict(
     steady_predict_ms = (time.perf_counter() - start) * 1000.0 / float(iterations)
     if prediction is None:
         raise RuntimeError("No Core ML stateful prediction iterations ran.")
-    return np.asarray(next(iter(prediction.values()))), float(first_predict_ms), float(steady_predict_ms)
+    return (
+        np.asarray(next(iter(prediction.values()))),
+        float(first_predict_ms),
+        float(steady_predict_ms),
+    )
 
 
 @contextlib.contextmanager
@@ -987,6 +1152,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="float32",
         help="Normal prediction input dtype. float32 is the P1a baseline; float16 is experimental.",
     )
+    parser.add_argument(
+        "--state-layout",
+        choices=("packed", "per-layer"),
+        default="packed",
+        help="MLState layout for text+speaker context KV.",
+    )
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--ref-wav", type=Path, default=DEFAULT_REF_WAV)
@@ -1005,6 +1176,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    normalize_state_layout(args.state_layout)
     if args.mode != MODE_COND_ONLY:
         raise ValueError("--mode independent3 is not implemented for P1a; use --mode cond-only.")
     if args.seconds <= 0:
@@ -1025,6 +1197,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def _base_failure_summary(args: argparse.Namespace, reason: str) -> dict[str, Any]:
     require_ne_placement = not bool(args.no_require_ne_placement)
+    state_layout = state_layout_arg(args)
     return {
         "sequence_length": None,
         "text_len": None,
@@ -1032,7 +1205,7 @@ def _base_failure_summary(args: argparse.Namespace, reason: str) -> dict[str, An
         "speaker_context_bucket": int(args.speaker_context_bucket),
         "c_ctx_bucket": None,
         "state_kv_bytes": None,
-        "state_layout": STATE_LAYOUT,
+        "state_layout": state_layout,
         "io_dtype": str(args.io_dtype),
         "convert_seconds": None,
         "make_state_ms": None,
@@ -1048,6 +1221,7 @@ def _base_failure_summary(args: argparse.Namespace, reason: str) -> dict[str, An
         "read_state_op_count": None,
         "read_state_counts_by_state": {},
         "large_read_state_ops": [],
+        "max_read_state_bytes_fp16": None,
         "slice_placement_summary": {},
         "status": "FAIL",
         "status_reasons": [reason],
@@ -1073,6 +1247,7 @@ def _available_failure_summary(
     read_state_op_count: int | None = None,
     read_state_counts_by_state: dict[str, Any] | None = None,
     large_read_state_ops: list[dict[str, Any]] | None = None,
+    max_read_state_bytes_fp16: int | None = None,
     slice_placement_summary: dict[str, Any] | None = None,
     state_metrics: dict[str, Any] | None = None,
     first_predict_ms: float | None = None,
@@ -1081,6 +1256,7 @@ def _available_failure_summary(
     rel_diff: float | None = None,
 ) -> dict[str, Any]:
     summary = _base_failure_summary(args, reason)
+    state_layout = state_layout_arg(args)
     if metadata is not None:
         summary.update(
             {
@@ -1098,11 +1274,7 @@ def _available_failure_summary(
                 "speaker_context_len": int(packed.speaker_context_len),
                 "speaker_context_bucket": int(packed.speaker_context_bucket),
                 "c_ctx_bucket": int(packed.c_ctx_bucket),
-                "state_layout_shape": {
-                    "context_k_state": [int(dim) for dim in packed.context_k_state.shape],
-                    "context_v_state": [int(dim) for dim in packed.context_v_state.shape],
-                    "valid_mask_state": [int(dim) for dim in packed.valid_mask_state.shape],
-                },
+                "state_layout_shape": state_payload_shapes(packed, state_layout=state_layout),
             }
         )
     if state_kv_bytes is not None:
@@ -1125,6 +1297,8 @@ def _available_failure_summary(
         summary["read_state_counts_by_state"] = read_state_counts_by_state
     if large_read_state_ops is not None:
         summary["large_read_state_ops"] = large_read_state_ops
+    if max_read_state_bytes_fp16 is not None:
+        summary["max_read_state_bytes_fp16"] = int(max_read_state_bytes_fp16)
     if slice_placement_summary is not None:
         summary["slice_placement_summary"] = slice_placement_summary
     if state_metrics is not None:
@@ -1153,6 +1327,7 @@ def _available_failure_summary(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     validate_args(args)
+    state_layout = state_layout_arg(args)
     require_ne_placement = not bool(args.no_require_ne_placement)
 
     ct = real_bench.import_coremltools()
@@ -1163,19 +1338,26 @@ def main(argv: list[str] | None = None) -> int:
     if platform.system() != "Darwin":
         raise RuntimeError("Core ML prediction and PyTorch MPS baseline require macOS.")
     if not torch.backends.mps.is_available():
-        raise RuntimeError("PyTorch MPS baseline requested but torch.backends.mps.is_available() is False.")
+        raise RuntimeError(
+            "PyTorch MPS baseline requested but torch.backends.mps.is_available() is False."
+        )
 
     mps_device = torch.device("mps")
     checkpoint_path = real_bench.resolve_checkpoint_path(args.checkpoint)
-    print(f"[mode] {MODE_COND_ONLY}", flush=True)
-    print(f"[convert] compute_precision={compute_precision_name} io_dtype={args.io_dtype}", flush=True)
+    print(f"[mode] {MODE_COND_ONLY} state_layout={state_layout}", flush=True)
+    print(
+        f"[convert] compute_precision={compute_precision_name} io_dtype={args.io_dtype}", flush=True
+    )
     print(f"[coremltools] {ct.__version__}", flush=True)
     print(f"[torch] {torch.__version__}", flush=True)
 
     print("[load] actual checkpoint/model weights on MPS", flush=True)
     model, model_cfg, train_cfg = real_bench.load_actual_model(checkpoint_path, mps_device)
 
-    print("[prepare] tokenizer, codec-derived length, rem.wav reference, encoded conditions", flush=True)
+    print(
+        "[prepare] tokenizer, codec-derived length, rem.wav reference, encoded conditions",
+        flush=True,
+    )
     inputs_mps, metadata = real_bench.prepare_real_inputs(
         model=model,
         model_cfg=model_cfg,
@@ -1221,7 +1403,9 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    print("[benchmark] PyTorch MPS forward_with_encoded_conditions with context_kv_cache", flush=True)
+    print(
+        "[benchmark] PyTorch MPS forward_with_encoded_conditions with context_kv_cache", flush=True
+    )
     pytorch_output, pytorch_cached_avg_ms = benchmark_torch_cached_step(
         model,
         inputs_mps,
@@ -1242,6 +1426,7 @@ def main(argv: list[str] | None = None) -> int:
         sequence_length=int(metadata["sequence_length"]),
         num_layers=num_layers,
         c_ctx_bucket=packed.c_ctx_bucket,
+        state_layout=state_layout,
     ).eval()
 
     convert_seconds: float | None = None
@@ -1251,6 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
     read_state_op_count: int | None = None
     read_state_counts_by_state: dict[str, Any] = {}
     large_read_state_ops: list[dict[str, Any]] = []
+    max_read_state_bytes_fp16: int | None = None
     state_metrics: dict[str, Any] = {
         "make_state_ms": None,
         "write_state_ms": None,
@@ -1280,6 +1466,7 @@ def main(argv: list[str] | None = None) -> int:
                     "speaker_context_len": int(packed.speaker_context_len),
                     "c_ctx_bucket": int(packed.c_ctx_bucket),
                     "state_kv_bytes": int(state_kv_bytes),
+                    "state_layout_shape": state_payload_shapes(packed, state_layout=state_layout),
                     "pytorch_mps_cached_avg_ms": float(pytorch_cached_avg_ms),
                     "compute_precision": compute_precision_name,
                     "require_ne_placement": require_ne_placement,
@@ -1287,12 +1474,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
             return 1
-        print(f"[convert] Core ML stateful mlprogram CPU_AND_NE conversion: {convert_seconds:.3f} s", flush=True)
+        print(
+            f"[convert] Core ML stateful mlprogram CPU_AND_NE conversion: {convert_seconds:.3f} s",
+            flush=True,
+        )
 
         mil_summary = mil_state_op_summary(mlmodel)
         read_state_op_count = mil_summary.get("read_state_op_count")
         read_state_counts_by_state = mil_summary.get("read_state_counts_by_state", {})
         large_read_state_ops = mil_summary.get("large_read_state_ops", [])
+        max_read_state_bytes_fp16 = mil_summary.get("max_read_state_bytes_fp16")
 
         compute_unit = ct.ComputeUnit.CPU_AND_NE
         plan_report = compute_plan_report(ct, mlmodel, compute_unit)
@@ -1308,6 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
                     "read_state_op_count": read_state_op_count,
                     "read_state_counts_by_state": read_state_counts_by_state,
                     "large_read_state_ops": large_read_state_ops,
+                    "max_read_state_bytes_fp16": max_read_state_bytes_fp16,
                     "slice_placement_summary": slice_placement_summary,
                 },
                 ensure_ascii=False,
@@ -1318,7 +1510,11 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             print("[state] make_state + np.float32 write_state", flush=True)
-            state, state_metrics = make_and_write_state(mlmodel, packed)
+            state, state_metrics = make_and_write_state(
+                mlmodel,
+                packed,
+                state_layout=state_layout,
+            )
         except Exception as exc:
             reason = f"np.float32 write_state failed: {type(exc).__name__}: {first_line(exc)}"
             summary = _base_failure_summary(args, reason)
@@ -1330,6 +1526,7 @@ def main(argv: list[str] | None = None) -> int:
                     "speaker_context_bucket": int(packed.speaker_context_bucket),
                     "c_ctx_bucket": int(packed.c_ctx_bucket),
                     "state_kv_bytes": int(state_kv_bytes),
+                    "state_layout_shape": state_payload_shapes(packed, state_layout=state_layout),
                     "convert_seconds": float(convert_seconds),
                     "pytorch_mps_cached_avg_ms": float(pytorch_cached_avg_ms),
                     "raw_compute_plan_counts": raw_compute_plan_counts,
@@ -1337,6 +1534,7 @@ def main(argv: list[str] | None = None) -> int:
                     "read_state_op_count": read_state_op_count,
                     "read_state_counts_by_state": read_state_counts_by_state,
                     "large_read_state_ops": large_read_state_ops,
+                    "max_read_state_bytes_fp16": max_read_state_bytes_fp16,
                     "slice_placement_summary": slice_placement_summary,
                     "compute_precision": compute_precision_name,
                     "require_ne_placement": require_ne_placement,
@@ -1389,6 +1587,7 @@ def main(argv: list[str] | None = None) -> int:
                 read_state_op_count=read_state_op_count,
                 read_state_counts_by_state=read_state_counts_by_state,
                 large_read_state_ops=large_read_state_ops,
+                max_read_state_bytes_fp16=max_read_state_bytes_fp16,
                 slice_placement_summary=slice_placement_summary,
                 state_metrics=state_metrics,
             )
@@ -1414,6 +1613,7 @@ def main(argv: list[str] | None = None) -> int:
             read_state_op_count=read_state_op_count,
             read_state_counts_by_state=read_state_counts_by_state,
             large_read_state_ops=large_read_state_ops,
+            max_read_state_bytes_fp16=max_read_state_bytes_fp16,
             slice_placement_summary=slice_placement_summary,
             state_metrics=state_metrics,
             first_predict_ms=first_predict_ms,
@@ -1421,9 +1621,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
         return 1
-    speedup = (
-        float(pytorch_cached_avg_ms / steady_predict_ms) if steady_predict_ms > 0 else None
-    )
+    speedup = float(pytorch_cached_avg_ms / steady_predict_ms) if steady_predict_ms > 0 else None
 
     status, status_reasons = evaluate_stateful_status(
         conversion_ok=True,
@@ -1436,6 +1634,8 @@ def main(argv: list[str] | None = None) -> int:
         first_predict_ms=first_predict_ms,
         write_state_ms=state_metrics.get("write_state_ms"),
         read_state_op_count=read_state_op_count,
+        state_layout=state_layout,
+        num_layers=num_layers,
         read_state_error=state_metrics.get("read_state_error"),
         read_state_max_abs_diff=state_metrics.get("read_state_max_abs_diff"),
         large_read_state_ops=large_read_state_ops,
@@ -1459,12 +1659,8 @@ def main(argv: list[str] | None = None) -> int:
         "speaker_context_bucket": int(packed.speaker_context_bucket),
         "c_ctx_bucket": int(packed.c_ctx_bucket),
         "state_kv_bytes": int(state_kv_bytes),
-        "state_layout": STATE_LAYOUT,
-        "state_layout_shape": {
-            "context_k_state": [int(dim) for dim in packed.context_k_state.shape],
-            "context_v_state": [int(dim) for dim in packed.context_v_state.shape],
-            "valid_mask_state": [int(dim) for dim in packed.valid_mask_state.shape],
-        },
+        "state_layout": state_layout,
+        "state_layout_shape": state_payload_shapes(packed, state_layout=state_layout),
         "io_dtype": str(args.io_dtype),
         "convert_seconds": float(convert_seconds),
         "make_state_ms": state_metrics.get("make_state_ms"),
@@ -1485,6 +1681,7 @@ def main(argv: list[str] | None = None) -> int:
         "read_state_op_count": read_state_op_count,
         "read_state_counts_by_state": read_state_counts_by_state,
         "large_read_state_ops": large_read_state_ops,
+        "max_read_state_bytes_fp16": max_read_state_bytes_fp16,
         "slice_placement_summary": slice_placement_summary,
         "status": status,
         "status_reasons": status_reasons,
