@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ramo.irodori-tts-openai-api</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/uv</string>
+    <string>run</string>
+    <string>python</string>
+    <string>openai_api_server.py</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>19841</string>
+    <string>--model-device</string>
+    <string>mps</string>
+    <string>--codec-device</string>
+    <string>mps</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ramo/Services/Irodori-TTS</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ramo/Services/Irodori-TTS/logs/openai-api.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/ramo/Services/Irodori-TTS/logs/openai-api.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+</dict>
+</plist>

@@ -217,3 +217,11 @@ __marimo__/
 
 gradio_outputs/
 gradio_outputs_voicedesign/
+
+# Irodori local/generated artifacts
+logs/
+outputs/
+rem.wav
+rem_sexy.wav
+*.mlpackage/
+*.mlmodelc/
