@@ -878,10 +878,27 @@ class InMemoryCoreMLCacheManager:
 
     def delete_condition_cache(self, cache_id: str) -> bool:
         _validate_non_empty_string("cache_id", cache_id)
-        if cache_id not in self._condition_caches:
+        handle = self._condition_caches.get(cache_id)
+        if handle is None:
             return False
         del self._condition_caches[cache_id]
+        self._prune_resident_bucket_if_unused(handle.reference_cache_id, handle.bucket_id)
         return True
+
+    def _prune_resident_bucket_if_unused(self, reference_cache_id: str, bucket_id: str) -> None:
+        reference = self._reference_caches.get(reference_cache_id)
+        if reference is None:
+            return
+        if any(
+            condition.reference_cache_id == reference_cache_id and condition.bucket_id == bucket_id
+            for condition in self._condition_caches.values()
+        ):
+            return
+        reference.resident_buckets = tuple(
+            resident_bucket
+            for resident_bucket in reference.resident_buckets
+            if resident_bucket != bucket_id
+        )
 
     def require_condition_cache(
         self,
@@ -969,9 +986,18 @@ class InMemoryCoreMLCacheManager:
             for cache_id, handle in self._condition_caches.items()
             if self._is_expired(handle, now) or handle.reference_cache_id in expired_reference_ids
         }
+        expired_condition_handles = {
+            cache_id: self._condition_caches[cache_id] for cache_id in expired_condition_ids
+        }
 
         for cache_id in expired_condition_ids:
             del self._condition_caches[cache_id]
+        for handle in expired_condition_handles.values():
+            if handle.reference_cache_id not in expired_reference_ids:
+                self._prune_resident_bucket_if_unused(
+                    handle.reference_cache_id,
+                    handle.bucket_id,
+                )
         for cache_id in expired_reference_ids:
             del self._reference_caches[cache_id]
 

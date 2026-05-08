@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import math
 import threading
 from contextlib import asynccontextmanager
@@ -11,9 +13,26 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
 
+from irodori_tts.coreml_cache import (
+    BRANCH_LAYOUT_COND1,
+    BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3,
+    CacheConflictError,
+    CacheExpiredError,
+    CacheNotFoundError,
+    CacheValidationError,
+    ConditionCacheRequest,
+    CoreMLConditionBucket,
+    InMemoryCoreMLCacheManager,
+    ReferenceCacheRequest,
+    cache_create_status_code,
+    cache_exception_to_http_error,
+    condition_cache_response,
+    reference_cache_response,
+)
 from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
@@ -31,6 +50,25 @@ MODEL_CREATED = 1700000000
 SUPPORTED_RESPONSE_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
 SECONDS_ROUND_INCREMENT = 0.5
 MAX_SAFE_SEGMENT_SECONDS = 30.0
+CACHE_MODE_CREATE_OR_REUSE = "create_or_reuse"
+CACHE_MODE_REFRESH = "refresh"
+CACHE_CREATE_MODES = {CACHE_MODE_CREATE_OR_REUSE, CACHE_MODE_REFRESH}
+CACHE_EXCEPTIONS = (
+    CacheConflictError,
+    CacheExpiredError,
+    CacheNotFoundError,
+    CacheValidationError,
+)
+CONDITION_CFG_SCALE_DEFAULTS = {
+    "scale_text": 3.0,
+    "scale_speaker": 5.0,
+    "scale_caption": 0.0,
+}
+CONDITION_CFG_WINDOW_DEFAULTS = {
+    "min_t": 0.5,
+    "max_t": 1.0,
+}
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -148,6 +186,416 @@ def _require_object(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def _cache_error_response(exc: Exception) -> JSONResponse:
+    error = cache_exception_to_http_error(exc)
+    return JSONResponse(status_code=error.status_code, content=error.payload)
+
+
+def _cache_require_object(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise CacheValidationError("request body must be a JSON object")
+    return payload
+
+
+def _cache_create_mode(payload: dict[str, Any]) -> str:
+    value = payload.get("cache_mode", CACHE_MODE_CREATE_OR_REUSE)
+    if not isinstance(value, str):
+        raise CacheValidationError("cache_mode must be a string")
+    cache_mode = value.strip().lower()
+    if cache_mode not in CACHE_CREATE_MODES:
+        raise CacheValidationError("cache_mode must be create_or_reuse or refresh")
+    return cache_mode
+
+
+def _cache_optional_text(
+    payload: dict[str, Any],
+    field: str,
+    default: str | None = None,
+    *,
+    allow_none: bool = False,
+) -> str | None:
+    value = payload.get(field, _MISSING)
+    if value is _MISSING:
+        return default
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise CacheValidationError(f"{field} must be a non-empty string")
+    return value
+
+
+def _cache_optional_positive_int(
+    payload: dict[str, Any],
+    field: str,
+    default: int | None = None,
+) -> int | None:
+    value = payload.get(field, _MISSING)
+    if value is _MISSING:
+        return default
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise CacheValidationError(f"{field} must be a positive int")
+    return value
+
+
+def _cache_optional_non_negative_int(
+    payload: dict[str, Any],
+    field: str,
+    default: int,
+) -> int:
+    value = payload.get(field, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CacheValidationError(f"{field} must be a non-negative int")
+    return value
+
+
+def _cache_optional_bool(payload: dict[str, Any], field: str, default: bool) -> bool:
+    value = payload.get(field, default)
+    if not isinstance(value, bool):
+        raise CacheValidationError(f"{field} must be a bool")
+    return value
+
+
+def _cache_optional_metadata(payload: dict[str, Any]) -> dict[str, Any] | None:
+    value = payload.get("metadata")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise CacheValidationError("metadata must be an object")
+    if any(not isinstance(key, str) for key in value):
+        raise CacheValidationError("metadata keys must be strings")
+    return value
+
+
+def _cache_ttl_seconds(payload: dict[str, Any]) -> float | None:
+    value = payload.get("ttl_seconds")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        raise CacheValidationError("ttl_seconds must be positive when supplied")
+    if value <= 0:
+        raise CacheValidationError("ttl_seconds must be positive when supplied")
+    return float(value)
+
+
+def _cache_required_normalized_text(payload: dict[str, Any], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str):
+        raise CacheValidationError(f"{field} must be a string")
+    text = value.strip()
+    if text == "":
+        raise CacheValidationError(f"{field} must be non-empty")
+    return text
+
+
+def _cache_optional_normalized_text(payload: dict[str, Any], field: str) -> str | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CacheValidationError(f"{field} must be a string")
+    text = value.strip()
+    return text or None
+
+
+def _cache_resolve_condition_caption(payload: dict[str, Any]) -> str | None:
+    instructions = _cache_optional_normalized_text(payload, "instructions")
+    instruction = _cache_optional_normalized_text(payload, "instruction")
+    caption = _cache_optional_normalized_text(payload, "caption")
+
+    if instructions is not None and instruction is not None and instructions != instruction:
+        raise CacheValidationError(
+            "instructions and instruction must match when both are provided",
+        )
+    resolved_instruction = instructions if instructions is not None else instruction
+
+    if caption is not None and resolved_instruction is not None and caption != resolved_instruction:
+        raise CacheValidationError("caption must match instructions when both are provided")
+
+    return resolved_instruction if resolved_instruction is not None else caption
+
+
+def _cache_optional_seconds(payload: dict[str, Any]) -> float | None:
+    value = payload.get("seconds")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise CacheValidationError("seconds must be a number")
+    seconds = float(value)
+    if not math.isfinite(seconds):
+        raise CacheValidationError("seconds must be finite")
+    if seconds <= 0:
+        raise CacheValidationError("seconds must be positive")
+    return seconds
+
+
+def _cache_delete_cascade(value: str | None) -> bool:
+    if value is None:
+        return True
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise CacheValidationError("cascade must be one of: true, false, 1, 0, yes, no")
+
+
+def _validate_reference_cache_source(payload: dict[str, Any]) -> None:
+    source = payload.get("source")
+    if source is None:
+        return
+    if not isinstance(source, dict):
+        raise CacheValidationError("source must be an object")
+    source_type = source.get("type", "server_default")
+    if source_type != "server_default":
+        raise CacheValidationError("source.type must be server_default for metadata-only caches")
+
+
+def _reference_cache_request(
+    payload: dict[str, Any],
+    settings: ServerSettings,
+) -> ReferenceCacheRequest:
+    _validate_reference_cache_source(payload)
+    return ReferenceCacheRequest(
+        model_fingerprint=str(
+            _cache_optional_text(
+                payload,
+                "model_fingerprint",
+                f"model:{settings.checkpoint}",
+            ),
+        ),
+        codec_fingerprint=str(
+            _cache_optional_text(
+                payload,
+                "codec_fingerprint",
+                f"codec:{settings.codec_repo}",
+            ),
+        ),
+        reference_fingerprint=str(
+            _cache_optional_text(
+                payload,
+                "reference_fingerprint",
+                f"server_default:{settings.reference_wav}",
+            ),
+        ),
+        speaker_context_len=int(
+            _cache_optional_positive_int(payload, "speaker_context_len", 1),
+        ),
+        memory_bytes=_cache_optional_non_negative_int(payload, "memory_bytes", 0),
+        ttl_seconds=_cache_ttl_seconds(payload),
+        metadata=_cache_optional_metadata(payload),
+        model=_cache_optional_text(payload, "model", settings.api_model_id, allow_none=True),
+        ref_len=_cache_optional_positive_int(payload, "ref_len"),
+        speaker_dim=_cache_optional_positive_int(payload, "speaker_dim"),
+        memory_bytes_estimated=_cache_optional_bool(
+            payload,
+            "memory_bytes_estimated",
+            True,
+        ),
+    )
+
+
+def _condition_cache_bucket(payload: dict[str, Any]) -> CoreMLConditionBucket:
+    value = payload.get("bucket")
+    if value is None:
+        bucket_payload: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        bucket_payload = value
+    else:
+        raise CacheValidationError("bucket must be an object")
+
+    speaker_context_len_field = (
+        "speaker_context_len_bucket"
+        if "speaker_context_len_bucket" in bucket_payload
+        else "speaker_context_len"
+    )
+    try:
+        return CoreMLConditionBucket(
+            sequence_length=int(
+                _cache_optional_positive_int(bucket_payload, "sequence_length", 100),
+            ),
+            text_len=int(_cache_optional_positive_int(bucket_payload, "text_len", 256)),
+            speaker_context_len_bucket=int(
+                _cache_optional_positive_int(
+                    bucket_payload,
+                    speaker_context_len_field,
+                    160,
+                ),
+            ),
+        )
+    except ValueError as exc:
+        raise CacheValidationError(str(exc)) from exc
+
+
+def _condition_cfg(payload: dict[str, Any]) -> dict[str, Any]:
+    value = payload.get("cfg", {})
+    if value is None:
+        cfg_payload: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        cfg_payload = value
+    else:
+        raise CacheValidationError("cfg must be an object")
+
+    mode_value = cfg_payload.get("mode", "cond")
+    if mode_value is None:
+        mode = "cond"
+    elif isinstance(mode_value, str):
+        mode = mode_value.strip().lower()
+    else:
+        raise CacheValidationError("cfg.mode must be a string")
+    if mode not in {"independent", "cond", "none"}:
+        raise CacheValidationError("cfg.mode must be independent, cond, or none")
+
+    canonical_cfg: dict[str, Any] = {"mode": mode}
+    for field, default in CONDITION_CFG_SCALE_DEFAULTS.items():
+        canonical_cfg[field] = _condition_cfg_float(
+            cfg_payload,
+            field,
+            default,
+            min_value=0.0,
+        )
+    for field, default in CONDITION_CFG_WINDOW_DEFAULTS.items():
+        canonical_cfg[field] = _condition_cfg_float(
+            cfg_payload,
+            field,
+            default,
+            min_value=0.0,
+            max_value=1.0,
+        )
+    if canonical_cfg["min_t"] > canonical_cfg["max_t"]:
+        raise CacheValidationError("cfg.min_t must be <= cfg.max_t")
+    return canonical_cfg
+
+
+def _condition_cfg_float(
+    cfg_payload: dict[str, Any],
+    field: str,
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    value = cfg_payload.get(field, default)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise CacheValidationError(f"cfg.{field} must be a number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise CacheValidationError(f"cfg.{field} must be finite")
+    if min_value is not None and parsed < min_value:
+        raise CacheValidationError(f"cfg.{field} must be >= {min_value}")
+    if max_value is not None and parsed > max_value:
+        raise CacheValidationError(f"cfg.{field} must be <= {max_value}")
+    return parsed
+
+
+def _condition_branch_layouts(
+    payload: dict[str, Any],
+    cfg: dict[str, Any],
+) -> tuple[str, ...] | list[str]:
+    value = payload.get("branch_layouts", _MISSING)
+    if value is not _MISSING:
+        if not isinstance(value, list | tuple):
+            raise CacheValidationError("branch_layouts must be a list")
+        return value
+
+    mode = cfg["mode"]
+    if mode == "independent":
+        return (BRANCH_LAYOUT_COND1, BRANCH_LAYOUT_INDEPENDENT_TEXT_SPEAKER3)
+    if mode in {"cond", "none"}:
+        return (BRANCH_LAYOUT_COND1,)
+    raise CacheValidationError("cfg.mode must be independent, cond, or none")
+
+
+def _condition_fingerprint(
+    payload: dict[str, Any],
+    bucket: CoreMLConditionBucket,
+    cfg: dict[str, Any],
+    input_text: str,
+    caption: str | None,
+    seconds: float | None,
+) -> str:
+    supplied = _cache_optional_text(
+        payload,
+        "condition_fingerprint",
+        None,
+        allow_none=True,
+    )
+
+    fingerprint_payload = {
+        "input": input_text,
+        "caption": caption,
+        "seconds": seconds,
+        "bucket": {
+            "sequence_length": bucket.sequence_length,
+            "text_len": bucket.text_len,
+            "speaker_context_len": bucket.speaker_context_len_bucket,
+        },
+        "cfg": cfg,
+    }
+    encoded = json.dumps(
+        fingerprint_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    canonical = f"condition:{hashlib.sha256(encoded).hexdigest()}"
+    if supplied is not None and supplied != canonical:
+        raise CacheValidationError("condition_fingerprint does not match canonical request")
+    return canonical
+
+
+def _condition_cache_request(
+    payload: dict[str, Any],
+    settings: ServerSettings,
+    cache_manager: InMemoryCoreMLCacheManager,
+) -> ConditionCacheRequest:
+    reference_cache_id = _cache_optional_text(payload, "reference_cache_id")
+    if reference_cache_id is None:
+        raise CacheValidationError("reference_cache_id must be a non-empty string")
+
+    input_text = _cache_required_normalized_text(payload, "input")
+    caption = _cache_resolve_condition_caption(payload)
+    seconds = _cache_optional_seconds(payload)
+    bucket = _condition_cache_bucket(payload)
+    cfg = _condition_cfg(payload)
+    speaker_context_len = _cache_optional_positive_int(payload, "speaker_context_len")
+    if speaker_context_len is None:
+        speaker_context_len = cache_manager.get_reference_cache(
+            reference_cache_id
+        ).speaker_context_len
+
+    return ConditionCacheRequest(
+        reference_cache_id=reference_cache_id,
+        model_fingerprint=str(
+            _cache_optional_text(
+                payload,
+                "model_fingerprint",
+                f"model:{settings.checkpoint}",
+            ),
+        ),
+        tokenizer_fingerprint=str(
+            _cache_optional_text(
+                payload,
+                "tokenizer_fingerprint",
+                "tokenizer:default",
+            ),
+        ),
+        condition_fingerprint=_condition_fingerprint(
+            payload,
+            bucket,
+            cfg,
+            input_text,
+            caption,
+            seconds,
+        ),
+        bucket=bucket,
+        speaker_context_len=int(speaker_context_len),
+        branch_layouts=_condition_branch_layouts(payload, cfg),
+        ttl_seconds=_cache_ttl_seconds(payload),
+        metadata=_cache_optional_metadata(payload),
+    )
+
+
 def _required_text(payload: dict[str, Any], field: str) -> str:
     value = payload.get(field)
     if not isinstance(value, str):
@@ -187,22 +635,14 @@ def _resolve_caption(payload: dict[str, Any]) -> str | None:
     instruction = _normalized("instruction")
     caption = _normalized("caption")
 
-    if (
-        instructions is not None
-        and instruction is not None
-        and instructions != instruction
-    ):
+    if instructions is not None and instruction is not None and instructions != instruction:
         raise HTTPException(
             status_code=400,
             detail="'instructions' and 'instruction' must match when both are provided.",
         )
     resolved_instruction = instructions if instructions is not None else instruction
 
-    if (
-        caption is not None
-        and resolved_instruction is not None
-        and caption != resolved_instruction
-    ):
+    if caption is not None and resolved_instruction is not None and caption != resolved_instruction:
         raise HTTPException(
             status_code=400,
             detail="'caption' must match 'instructions' when both are provided.",
@@ -482,7 +922,9 @@ def _audio_array(audio):
     if tensor.ndim == 1:
         tensor = tensor.unsqueeze(0)
     if tensor.ndim != 2:
-        raise ValueError(f"Expected audio tensor with shape (channels, samples), got {tuple(tensor.shape)}")
+        raise ValueError(
+            f"Expected audio tensor with shape (channels, samples), got {tuple(tensor.shape)}"
+        )
     return tensor.clamp(-1.0, 1.0).transpose(0, 1).contiguous().numpy()
 
 
@@ -517,7 +959,9 @@ def _normalize_audio_segment(audio):
     if audio.ndim == 1:
         audio = audio.unsqueeze(0)
     if audio.ndim != 2:
-        raise ValueError(f"Expected audio tensor with shape (channels, samples), got {tuple(audio.shape)}")
+        raise ValueError(
+            f"Expected audio tensor with shape (channels, samples), got {tuple(audio.shape)}"
+        )
     return audio
 
 
@@ -555,6 +999,7 @@ def _health_payload(settings: ServerSettings, state: RuntimeState) -> dict[str, 
 
 def create_app(settings: ServerSettings) -> FastAPI:
     state = RuntimeState(settings)
+    cache_manager = InMemoryCoreMLCacheManager()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -567,6 +1012,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
             clear_cached_runtime()
 
     app = FastAPI(title="Irodori-TTS OpenAI-compatible API", version="0.1.0", lifespan=lifespan)
+    app.state.coreml_cache_manager = cache_manager
 
     @app.api_route("/v1/health", methods=["GET", "POST"])
     async def health() -> dict[str, Any]:
@@ -585,6 +1031,73 @@ def create_app(settings: ServerSettings) -> FastAPI:
                 }
             ],
         }
+
+    @app.post("/v1/tts/reference-caches")
+    async def create_reference_cache(payload: Any = Body(None)) -> JSONResponse:
+        try:
+            data = _cache_require_object(payload)
+            cache_mode = _cache_create_mode(data)
+            result = cache_manager.prepare_reference_cache(
+                _reference_cache_request(data, settings),
+                cache_mode=cache_mode,
+            )
+            return JSONResponse(
+                status_code=cache_create_status_code(result),
+                content=reference_cache_response(result),
+            )
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc)
+
+    @app.get("/v1/tts/reference-caches/{cache_id}")
+    async def get_reference_cache(cache_id: str) -> JSONResponse:
+        try:
+            handle = cache_manager.get_reference_cache(cache_id)
+            return JSONResponse(content=reference_cache_response(handle))
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc)
+
+    @app.delete("/v1/tts/reference-caches/{cache_id}")
+    async def delete_reference_cache(cache_id: str, request: Request) -> Response:
+        try:
+            cascade = _cache_delete_cascade(request.query_params.get("cascade"))
+            if not cache_manager.delete_reference_cache(cache_id, cascade=cascade):
+                raise CacheNotFoundError(f"reference cache not found: {cache_id}")
+            return Response(status_code=204)
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc)
+
+    @app.post("/v1/tts/condition-caches")
+    async def create_condition_cache(payload: Any = Body(None)) -> JSONResponse:
+        try:
+            data = _cache_require_object(payload)
+            cache_mode = _cache_create_mode(data)
+            result = cache_manager.prepare_condition_cache(
+                _condition_cache_request(data, settings, cache_manager),
+                cache_mode=cache_mode,
+            )
+            return JSONResponse(
+                status_code=cache_create_status_code(result),
+                content=condition_cache_response(result),
+            )
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc)
+
+    @app.get("/v1/tts/condition-caches/{cache_id}")
+    async def get_condition_cache(cache_id: str) -> JSONResponse:
+        try:
+            handle = cache_manager.get_condition_cache(cache_id)
+            return JSONResponse(content=condition_cache_response(handle))
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc)
+
+    @app.delete("/v1/tts/condition-caches/{cache_id}")
+    async def delete_condition_cache(cache_id: str) -> Response:
+        try:
+            if not cache_manager.delete_condition_cache(cache_id):
+                raise CacheNotFoundError(f"condition cache not found: {cache_id}")
+            return Response(status_code=204)
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc)
 
     @app.post("/v1/audio/speech")
     async def audio_speech(payload: Any = Body(...)) -> Response:
@@ -682,9 +1195,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
 def parse_args() -> argparse.Namespace:
     default_device = _prefer_mps_device()
-    parser = argparse.ArgumentParser(
-        description="OpenAI-compatible HTTP TTS API for Irodori-TTS."
-    )
+    parser = argparse.ArgumentParser(description="OpenAI-compatible HTTP TTS API for Irodori-TTS.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument(

@@ -253,6 +253,25 @@ def test_delete_reference_cache_cascade_removes_dependent_conditions() -> None:
     assert manager.delete_reference_cache(reference.id) is False
 
 
+def test_delete_condition_cache_prunes_unused_reference_bucket_only_after_last_user() -> None:
+    manager = coreml_cache.InMemoryCoreMLCacheManager(clock=Clock())
+    reference = manager.prepare_reference_cache(reference_request()).handle
+    first_condition = manager.prepare_condition_cache(
+        condition_request(reference.id, condition_fingerprint="condition-a"),
+    ).handle
+    second_condition = manager.prepare_condition_cache(
+        condition_request(reference.id, condition_fingerprint="condition-b"),
+    ).handle
+
+    assert reference.resident_buckets == (first_condition.bucket_id,)
+
+    assert manager.delete_condition_cache(first_condition.id) is True
+    assert reference.resident_buckets == (first_condition.bucket_id,)
+
+    assert manager.delete_condition_cache(second_condition.id) is True
+    assert reference.resident_buckets == ()
+
+
 def test_prune_expired_removes_expired_references_and_dependent_conditions() -> None:
     clock = Clock()
     manager = coreml_cache.InMemoryCoreMLCacheManager(clock=clock)
@@ -282,6 +301,7 @@ def test_prune_expired_removes_expired_references_and_dependent_conditions() -> 
     with pytest.raises(coreml_cache.CacheNotFoundError):
         manager.get_condition_cache(dependent_condition.id)
     assert manager.get_reference_cache(live_reference.id).id == live_reference.id
+    assert live_reference.resident_buckets == ()
     with pytest.raises(coreml_cache.CacheNotFoundError):
         manager.get_condition_cache(expiring_condition.id)
 
