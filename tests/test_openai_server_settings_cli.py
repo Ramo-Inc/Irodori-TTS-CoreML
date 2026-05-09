@@ -49,6 +49,25 @@ def test_cli_defaults_match_server_settings_defaults() -> None:
     assert settings.max_seconds == pytest.approx(70.0)
     assert settings.chars_per_second == pytest.approx(5.5)
     assert settings.seconds_padding == pytest.approx(1.5)
+    assert settings.default_speed == pytest.approx(1.2)
+
+
+def test_cli_default_speed_accepts_explicit_value() -> None:
+    args = parse_args(["--default-speed", "1.5"])
+    settings = build_settings_from_args(args)
+    assert settings.default_speed == pytest.approx(1.5)
+
+
+def test_cli_default_speed_below_minimum_rejected() -> None:
+    args = parse_args(["--default-speed", "0.1"])
+    with pytest.raises(ValueError, match="--default-speed"):
+        build_settings_from_args(args)
+
+
+def test_cli_default_speed_above_maximum_rejected() -> None:
+    args = parse_args(["--default-speed", "5.0"])
+    with pytest.raises(ValueError, match="--default-speed"):
+        build_settings_from_args(args)
 
 
 def test_cli_max_seconds_safe_cap_matches_default() -> None:

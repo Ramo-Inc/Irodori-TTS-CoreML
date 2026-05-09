@@ -130,6 +130,7 @@ class ServerSettings:
     enable_resident_reference_cache: bool = True
     enable_resident_speaker_kv: bool = True
     enable_condition_packed_kv_cache: bool = False
+    default_speed: float = 1.2
 
 
 @dataclass(frozen=True)
@@ -1867,11 +1868,28 @@ def _count_non_whitespace_chars(text: str) -> int:
     return sum(1 for char in text if not char.isspace())
 
 
-def _estimate_generation_seconds_uncapped(text: str, settings: ServerSettings) -> float:
-    char_count = _count_non_whitespace_chars(text)
-    raw_seconds = (float(char_count) / float(settings.chars_per_second)) + float(
-        settings.seconds_padding
+def _resolve_speech_speed(payload: dict[str, Any], settings: ServerSettings) -> float:
+    value = _optional_float(
+        payload,
+        "speed",
+        float(settings.default_speed),
+        min_value=0.25,
+        max_value=4.0,
     )
+    if value is None:
+        return float(settings.default_speed)
+    return float(value)
+
+
+def _estimate_generation_seconds_uncapped(
+    text: str,
+    settings: ServerSettings,
+    *,
+    speed: float = 1.0,
+) -> float:
+    char_count = _count_non_whitespace_chars(text)
+    effective_cps = float(settings.chars_per_second) * float(speed)
+    raw_seconds = (float(char_count) / effective_cps) + float(settings.seconds_padding)
     return math.ceil(raw_seconds / SECONDS_ROUND_INCREMENT) * SECONDS_ROUND_INCREMENT
 
 
@@ -1879,8 +1897,13 @@ def _effective_segment_max_seconds(settings: ServerSettings) -> float:
     return min(float(settings.max_seconds), MAX_SAFE_SEGMENT_SECONDS)
 
 
-def _estimate_generation_seconds(text: str, settings: ServerSettings) -> float:
-    rounded = _estimate_generation_seconds_uncapped(text, settings)
+def _estimate_generation_seconds(
+    text: str,
+    settings: ServerSettings,
+    *,
+    speed: float = 1.0,
+) -> float:
+    rounded = _estimate_generation_seconds_uncapped(text, settings, speed=speed)
     return min(max(rounded, float(settings.min_seconds)), _effective_segment_max_seconds(settings))
 
 
@@ -1891,10 +1914,11 @@ SECONDARY_BOUNDARY_CHARS: frozenset[str] = frozenset(
 )
 
 
-def _speech_chunk_char_budget(settings: ServerSettings) -> int:
+def _speech_chunk_char_budget(settings: ServerSettings, *, speed: float = 1.0) -> int:
     segment_max_seconds = _effective_segment_max_seconds(settings)
     usable_seconds = max(0.0, segment_max_seconds - float(settings.seconds_padding))
-    budget = int(math.floor(usable_seconds * float(settings.chars_per_second)))
+    effective_cps = float(settings.chars_per_second) * float(speed)
+    budget = int(math.floor(usable_seconds * effective_cps))
     return max(20, min(SEGMENT_MAX_NON_WHITESPACE_CHARS, budget))
 
 
@@ -1957,8 +1981,13 @@ def _split_text_recursive_by_char_budget(text: str, char_budget: int) -> list[st
     return out
 
 
-def _split_text_for_auto_chunks(text: str, settings: ServerSettings) -> list[str]:
-    char_budget = _speech_chunk_char_budget(settings)
+def _split_text_for_auto_chunks(
+    text: str,
+    settings: ServerSettings,
+    *,
+    speed: float = 1.0,
+) -> list[str]:
+    char_budget = _speech_chunk_char_budget(settings, speed=speed)
     return _split_text_recursive_by_char_budget(text, char_budget)
 
 
@@ -1983,22 +2012,23 @@ def _build_speech_segment_plan(
         seconds = min(float(settings.seconds), segment_max_seconds)
         return SpeechSegmentPlan((SpeechSegment(text=text, seconds=seconds),), seconds, "fixed")
 
-    char_budget = _speech_chunk_char_budget(settings)
-    uncapped_seconds = _estimate_generation_seconds_uncapped(text, settings)
+    speed = _resolve_speech_speed(payload, settings)
+    char_budget = _speech_chunk_char_budget(settings, speed=speed)
+    uncapped_seconds = _estimate_generation_seconds_uncapped(text, settings, speed=speed)
     if (
         _count_non_whitespace_chars(text) <= char_budget
         and uncapped_seconds <= segment_max_seconds
     ):
-        seconds = _estimate_generation_seconds(text, settings)
+        seconds = _estimate_generation_seconds(text, settings, speed=speed)
         return SpeechSegmentPlan((SpeechSegment(text=text, seconds=seconds),), seconds, "auto")
 
-    chunks = _split_text_for_auto_chunks(text, settings)
+    chunks = _split_text_for_auto_chunks(text, settings, speed=speed)
     segments = tuple(
-        SpeechSegment(text=chunk, seconds=_estimate_generation_seconds(chunk, settings))
+        SpeechSegment(text=chunk, seconds=_estimate_generation_seconds(chunk, settings, speed=speed))
         for chunk in chunks
     )
     if not segments:
-        seconds = _estimate_generation_seconds(text, settings)
+        seconds = _estimate_generation_seconds(text, settings, speed=speed)
         return SpeechSegmentPlan((SpeechSegment(text=text, seconds=seconds),), seconds, "auto")
 
     seconds_mode = "auto-chunked" if len(segments) > 1 else "auto"
@@ -2025,6 +2055,8 @@ def _runtime_split_segment_recursive(
     segment: SpeechSegment,
     runtime: Any,
     settings: ServerSettings,
+    *,
+    speed: float = 1.0,
 ) -> list[SpeechSegment]:
     if segment.text.strip() == "":
         return []
@@ -2059,15 +2091,15 @@ def _runtime_split_segment_recursive(
 
     left_segment = SpeechSegment(
         text=left_text.strip(),
-        seconds=_estimate_generation_seconds(left_text, settings),
+        seconds=_estimate_generation_seconds(left_text, settings, speed=speed),
     )
     right_segment = SpeechSegment(
         text=right_text.strip(),
-        seconds=_estimate_generation_seconds(right_text, settings),
+        seconds=_estimate_generation_seconds(right_text, settings, speed=speed),
     )
     refined: list[SpeechSegment] = []
-    refined.extend(_runtime_split_segment_recursive(left_segment, runtime, settings))
-    refined.extend(_runtime_split_segment_recursive(right_segment, runtime, settings))
+    refined.extend(_runtime_split_segment_recursive(left_segment, runtime, settings, speed=speed))
+    refined.extend(_runtime_split_segment_recursive(right_segment, runtime, settings, speed=speed))
     return refined
 
 
@@ -2080,9 +2112,10 @@ def _lifespan_warmup_default_condition_cache(
     text = settings.default_condition_cache_prepare_text
     if not text:
         return
+    speed = float(settings.default_speed)
     plan = _build_speech_segment_plan({}, text, settings)
     if plan.seconds_mode.startswith("auto"):
-        plan = _runtime_refine_segment_plan_for_auto(plan, runtime, settings)
+        plan = _runtime_refine_segment_plan_for_auto(plan, runtime, settings, speed=speed)
     bucket_resolutions = _resolve_auto_bucket_resolutions(None, plan.segments, runtime)
     cache_resolutions = _auto_prepare_speech_caches(
         irodori=None,
@@ -2117,10 +2150,14 @@ def _runtime_refine_segment_plan_for_auto(
     plan: SpeechSegmentPlan,
     runtime: Any,
     settings: ServerSettings,
+    *,
+    speed: float = 1.0,
 ) -> SpeechSegmentPlan:
     refined: list[SpeechSegment] = []
     for segment in plan.segments:
-        refined.extend(_runtime_split_segment_recursive(segment, runtime, settings))
+        refined.extend(
+            _runtime_split_segment_recursive(segment, runtime, settings, speed=speed),
+        )
     if not refined:
         return plan
     if len(refined) == len(plan.segments) and all(
@@ -2503,7 +2540,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         text = _required_text(data, "input")
         # Compatibility-only fields such as model, voice, and reference_audio are
         # deliberately ignored. Runtime selection and speaker reference are server-owned.
-        _optional_float(data, "speed", 1.0, min_value=0.25, max_value=4.0)
+        speed = _resolve_speech_speed(data, settings)
         requested_format, output_format = _normalize_response_format(
             _optional_text(data, "response_format", "mp3")
         )
@@ -2603,6 +2640,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
                         segment_plan,
                         runtime,
                         settings,
+                        speed=speed,
                     )
                     if refined_plan is not segment_plan:
                         segment_plan = refined_plan
@@ -2785,6 +2823,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
                 _format_seconds_header(segment.seconds) for segment in segment_plan.segments
             ),
             "X-Irodori-Num-Steps": str(int(num_steps)),
+            "X-Irodori-Speed": _format_seconds_header(speed),
         }
         if len(segment_backends) > 1 or denoiser_backend == "mixed":
             headers["X-Irodori-Backend-Per-Segment"] = ",".join(segment_backends)
@@ -2890,6 +2929,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--seconds-padding", type=float, default=1.5)
+    parser.add_argument(
+        "--default-speed",
+        type=float,
+        default=1.2,
+        help=(
+            "Default playback speed multiplier for AUTO duration estimation when the "
+            "request omits 'speed'. Scales effective chars-per-second; does not affect "
+            "explicit 'seconds' requests. Range 0.25..4.0."
+        ),
+    )
     parser.add_argument(
         "--max-ref-seconds",
         type=float,
@@ -3035,6 +3084,9 @@ def build_settings_from_args(args: argparse.Namespace) -> ServerSettings:
         raise ValueError("--chars-per-second must be > 0.")
     if float(args.seconds_padding) < 0:
         raise ValueError("--seconds-padding must be >= 0.")
+    default_speed = float(args.default_speed)
+    if not math.isfinite(default_speed) or default_speed < 0.25 or default_speed > 4.0:
+        raise ValueError("--default-speed must be in the range [0.25, 4.0].")
     max_ref_seconds = float(args.max_ref_seconds)
     cache_max_memory_bytes = (
         None if args.cache_max_memory_bytes is None else int(args.cache_max_memory_bytes)
@@ -3091,6 +3143,7 @@ def build_settings_from_args(args: argparse.Namespace) -> ServerSettings:
         enable_resident_reference_cache=bool(args.enable_resident_reference_cache),
         enable_resident_speaker_kv=bool(args.enable_resident_speaker_kv),
         enable_condition_packed_kv_cache=bool(args.enable_condition_packed_kv_cache),
+        default_speed=default_speed,
     )
 
 

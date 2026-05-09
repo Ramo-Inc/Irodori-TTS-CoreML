@@ -269,11 +269,44 @@ def test_no_irodori_defaults_to_auto_prepare_with_coreml_stateful(
     assert response.headers["X-Irodori-Condition-Cache-Id"].startswith("cond_")
     assert response.headers["X-Irodori-Reference-Cache-Id"].startswith("ref_")
     assert "X-Irodori-Fallback-Reason" not in response.headers
+    assert response.headers["X-Irodori-Speed"] == "1.2"
     assert calls["get_runtime"] == 1
     assert runtime.requests == []
     assert len(runtime.fast_requests) == 1
     assert runtime.fast_requests[0][0].text == SPEECH_TEXT
     assert runtime.fast_requests[0][0].caption == CAPTION
+
+
+def test_default_speed_header_reflects_settings_default(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, _runtime, _calls = client_runtime
+    response = client.post("/v1/audio/speech", json=speech_payload())
+    assert response.status_code == 200
+    assert response.headers["X-Irodori-Speed"] == "1.2"
+
+
+def test_explicit_payload_speed_reflected_in_header(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, _runtime, _calls = client_runtime
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(speed=1.0),
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Irodori-Speed"] == "1"
+
+
+def test_invalid_payload_speed_rejected(
+    client_runtime: tuple[TestClient, FakeRuntime, dict[str, int]],
+) -> None:
+    client, _runtime, _calls = client_runtime
+    response = client.post(
+        "/v1/audio/speech",
+        json=speech_payload(speed=10.0),
+    )
+    assert response.status_code == 400
 
 
 def test_auto_bucket_planning_runs_off_event_loop(

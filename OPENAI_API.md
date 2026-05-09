@@ -40,6 +40,14 @@ splitting. Use `--seconds N` to force one fixed horizon for all requests, or sen
 extension field `"seconds": N` in one request to override only that request.
 Request-level `seconds` must be between `0.1` and `--max-seconds`.
 
+The server also applies a default playback speed multiplier via `--default-speed`
+(default `1.2`). It scales the effective chars-per-second used for AUTO duration
+estimation and CoreML bucket selection only — explicit request-level `seconds`
+and the `--seconds` server-fixed horizon are unaffected. Clients may override per
+request with the OpenAI `speed` field (range `0.25..4.0`); the resolved value is
+echoed back via `X-Irodori-Speed`. Padding (`--seconds-padding`) is preserved
+unchanged regardless of speed.
+
 For AUTO requests, the server selects the smallest CoreML bucket whose
 `(sequence_length, text_len)` covers the request from this preset list:
 `(S=256, T=32)`, `(S=512, T=64)`, `(S=1024, T=128)`, `(S=1536, T=192)`,
@@ -142,7 +150,7 @@ caption-conditioned style/control input.
 LaunchAgent autostart:
 
 The project includes [launchd/com.ramo.irodori-tts-openai-api.plist](launchd/com.ramo.irodori-tts-openai-api.plist).
-It runs `/opt/homebrew/bin/uv run python openai_api_server.py --host 0.0.0.0 --port 19841 --model-device mps --codec-device mps --preload --strict-coreml --max-seconds 70 --chars-per-second 5.5 --max-resident-speaker-kv-buckets 5` and warms up
+It runs `/opt/homebrew/bin/uv run python openai_api_server.py --host 0.0.0.0 --port 19841 --model-device mps --codec-device mps --preload --strict-coreml --max-seconds 70 --chars-per-second 5.5 --default-speed 1.2 --max-resident-speaker-kv-buckets 5` and warms up
 buckets `S=256,T=32,R=160`, `S=512,T=64,R=160`, `S=1024,T=128,R=160`,
 `S=1536,T=192,R=160`, and `S=2048,T=256,R=160` from
 `/Users/ramo/Services/Irodori-TTS`. As a user LaunchAgent, it starts at user login.

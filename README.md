@@ -121,6 +121,10 @@ A helper script, `scripts/irodori-openai-service.sh`, manages the server as a ma
   pushed segments into unnecessarily large S buckets), and warms up the
   `(S=256,T=32)`, `(S=512,T=64)`, `(S=1024,T=128)`, `(S=1536,T=192)`,
   `(S=2048,T=256)` buckets at `R=160`.
+- The plist also passes `--default-speed 1.2` so AUTO duration estimation and
+  bucket selection assume ~20% faster playback than the calibrated baseline.
+  Clients can override per-request via the OpenAI `speed` field; explicit
+  `seconds` requests are unaffected by this default.
 - `--default-condition-cache-prepare-text` runs an AUTO condition-cache warmup at
   startup against the configured default reference. It builds a segment plan,
   resolves the AUTO bucket, and prepares the condition cache (no audio is

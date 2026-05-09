@@ -728,7 +728,10 @@ def test_request_seconds_plan_skips_runtime_refine_in_strict_mode(
         plan: openai_api_server.SpeechSegmentPlan,
         _runtime: Any,
         _settings: ServerSettings,
+        *,
+        speed: float = 1.0,
     ) -> openai_api_server.SpeechSegmentPlan:
+        del speed
         refine_calls.append(plan.seconds_mode)
         return plan
 
@@ -774,7 +777,10 @@ def test_runtime_refine_runs_for_auto_seconds_plan(
         plan: openai_api_server.SpeechSegmentPlan,
         _runtime: Any,
         _settings: ServerSettings,
+        *,
+        speed: float = 1.0,
     ) -> openai_api_server.SpeechSegmentPlan:
+        del speed
         refine_calls.append(plan.seconds_mode)
         return plan
 
@@ -867,7 +873,9 @@ def test_default_chars_per_second_avoids_s1536_for_159_char_segment(
 ) -> None:
     default_settings = _service_default_settings(settings)
     text = "あ" * 159
-    plan = openai_api_server._build_speech_segment_plan({}, text, default_settings)
+    plan = openai_api_server._build_speech_segment_plan(
+        {"speed": 1.0}, text, default_settings,
+    )
     assert len(plan.segments) == 1
     segment = plan.segments[0]
     assert segment.seconds == pytest.approx(30.5)
@@ -918,4 +926,48 @@ def test_explicit_request_seconds_unaffected_by_default_chars_per_second(
     )
     assert plan.seconds_mode == "request"
     assert len(plan.segments) == 1
+    assert plan.segments[0].seconds == pytest.approx(12.0)
+
+
+def test_default_speed_setting_is_1_2(settings: ServerSettings) -> None:
+    default_settings = _service_default_settings(settings)
+    assert default_settings.default_speed == pytest.approx(1.2)
+
+
+def test_default_speed_reduces_estimated_seconds_for_auto_plan(
+    settings: ServerSettings,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    text = "あ" * 159
+    auto_plan = openai_api_server._build_speech_segment_plan(
+        {}, text, default_settings,
+    )
+    speed_one_plan = openai_api_server._build_speech_segment_plan(
+        {"speed": 1.0}, text, default_settings,
+    )
+    assert auto_plan.segments[0].seconds < speed_one_plan.segments[0].seconds
+    assert auto_plan.segments[0].seconds == pytest.approx(26.0)
+    assert speed_one_plan.segments[0].seconds == pytest.approx(30.5)
+
+
+def test_explicit_payload_speed_overrides_default_speed(
+    settings: ServerSettings,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    text = "あ" * 159
+    plan = openai_api_server._build_speech_segment_plan(
+        {"speed": 1.0}, text, default_settings,
+    )
+    assert plan.seconds_mode == "auto"
+    assert plan.segments[0].seconds == pytest.approx(30.5)
+
+
+def test_request_seconds_unaffected_by_default_speed(
+    settings: ServerSettings,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    plan = openai_api_server._build_speech_segment_plan(
+        {"seconds": 12.0}, "あ" * 159, default_settings,
+    )
+    assert plan.seconds_mode == "request"
     assert plan.segments[0].seconds == pytest.approx(12.0)
