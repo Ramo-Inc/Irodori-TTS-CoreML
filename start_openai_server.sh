@@ -13,6 +13,7 @@ exec uv run python openai_api_server.py \
   --strict-coreml \
   --max-seconds 70 \
   --chars-per-second 5.5 \
+  --seconds-padding 4.5 \
   --default-speed 1.0 \
   --default-num-steps 30 \
   --max-resident-speaker-kv-buckets 5 \

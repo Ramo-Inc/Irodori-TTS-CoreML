@@ -25,6 +25,8 @@
     <string>70</string>
     <string>--chars-per-second</string>
     <string>5.5</string>
+    <string>--seconds-padding</string>
+    <string>4.5</string>
     <string>--default-speed</string>
     <string>1.0</string>
     <string>--default-num-steps</string>
