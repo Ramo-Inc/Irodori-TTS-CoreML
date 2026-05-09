@@ -104,6 +104,47 @@ The hosted VoiceDesign demo is available at [Aratako/Irodori-TTS-500M-v2-VoiceDe
 
 `gradio_app.py` is for `Aratako/Irodori-TTS-500M-v2`. `gradio_app_voicedesign.py` is for `Aratako/Irodori-TTS-500M-v2-VoiceDesign`.
 
+## OpenAI-compatible API service (launchd)
+
+This project also includes an OpenAI-compatible `/v1/audio/speech` server (`openai_api_server.py`). See [OPENAI_API.md](OPENAI_API.md) for request examples and full API details.
+
+The server uses `rem.wav` next to `openai_api_server.py` as the server-owned default reference voice file. The OpenAI client `voice` field is accepted for compatibility only and is **ignored** for speaker selection.
+
+A helper script, `scripts/irodori-openai-service.sh`, manages the server as a macOS `launchd` user agent on port **19841** by default. The plist preloads the model and runs warmups at service process startup, so:
+
+- Warmup runs at startup / restart only — not on every request.
+- In-memory caches are lost on process restart and rebuilt on the next startup.
+
+### Common commands
+
+| Command | Purpose |
+|---------|---------|
+| `scripts/irodori-openai-service.sh deploy` | Stop old service, `uv sync`, install plist, start, wait for health. |
+| `scripts/irodori-openai-service.sh reload` | Stop, install plist, start — no `uv sync`. |
+| `scripts/irodori-openai-service.sh restart` | Stop / start the currently installed plist. |
+| `scripts/irodori-openai-service.sh status` | Show launchd load state and curl `/v1/health`. |
+| `scripts/irodori-openai-service.sh logs` | `tail -F` stdout and stderr logs. |
+| `scripts/irodori-openai-service.sh test` | POST two `/v1/audio/speech` requests and print timing / `X-Irodori-*` headers. |
+| `scripts/irodori-openai-service.sh stop` | `bootout` the service if loaded. |
+| `scripts/irodori-openai-service.sh uninstall` | Stop and remove the destination plist. |
+
+Options (place before the action):
+
+- `--no-sync` — Skip `uv sync` during `deploy`.
+- `--no-wait` — Skip waiting for `/v1/health` after start / restart / deploy / reload.
+- `--timeout SECONDS` — Health-wait timeout (default `420`).
+- `--port PORT` — Override the default port used to build the health URL.
+
+### Recommended flow after pulling / updating code
+
+```bash
+scripts/irodori-openai-service.sh deploy
+scripts/irodori-openai-service.sh status
+scripts/irodori-openai-service.sh test
+```
+
+> **Note**: The script uses `launchctl bootout` / `bootstrap` / `kickstart` only. It never reboots the launchd domain and does not kill arbitrary stray processes — clean those up manually if needed.
+
 ## Inference
 
 ### CLI
