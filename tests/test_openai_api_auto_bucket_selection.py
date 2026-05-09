@@ -50,73 +50,60 @@ def planning_context(
 
 
 @pytest.mark.parametrize(
-    ("patched_steps", "expected_sequence_length"),
+    ("patched_steps", "token_len", "expected_sequence_length", "expected_text_len"),
     [
-        (100, 100),
-        (101, 160),
-        (160, 160),
-        (161, 200),
-        (200, 200),
+        (1, 1, 256, 32),
+        (256, 32, 256, 32),
+        (257, 32, 512, 64),
+        (512, 64, 512, 64),
+        (513, 64, 1024, 128),
+        (1024, 128, 1024, 128),
+        (1025, 128, 1536, 192),
+        (1536, 192, 1536, 192),
+        (1537, 192, 2048, 256),
+        (2048, 256, 2048, 256),
+        (256, 33, 512, 64),
+        (256, 65, 1024, 128),
+        (256, 129, 1536, 192),
+        (256, 193, 2048, 256),
     ],
 )
-def test_auto_select_bucket_chooses_s100_s160_s200(
+def test_auto_select_bucket_picks_first_fitting_preset(
     patched_steps: int,
+    token_len: int,
     expected_sequence_length: int,
+    expected_text_len: int,
 ) -> None:
     resolution = openai_api_server._auto_select_bucket(
-        planning_context(patched_steps=patched_steps),
+        planning_context(patched_steps=patched_steps, token_len=token_len),
     )
 
     assert resolution.reason is None
     assert resolution.attempted is None
     assert resolution.bucket is not None
     assert resolution.bucket.sequence_length == expected_sequence_length
-    assert resolution.bucket.text_len == 64
-    assert resolution.bucket.speaker_context_len_bucket == 160
-
-
-@pytest.mark.parametrize(
-    ("token_len", "expected_text_len"),
-    [
-        (1, 64),
-        (64, 64),
-        (65, 128),
-        (128, 128),
-        (129, 256),
-        (256, 256),
-    ],
-)
-def test_auto_bucket_uses_smallest_text_bucket(
-    token_len: int,
-    expected_text_len: int,
-) -> None:
-    resolution = openai_api_server._auto_select_bucket(
-        planning_context(patched_steps=100, token_len=token_len),
-    )
-
-    assert resolution.reason is None
-    assert resolution.bucket is not None
     assert resolution.bucket.text_len == expected_text_len
+    assert resolution.bucket.speaker_context_len_bucket == 160
 
 
 def test_auto_bucket_oversize_t_returns_reason() -> None:
     resolution = openai_api_server._auto_select_bucket(
-        planning_context(patched_steps=100, token_len=257),
+        planning_context(patched_steps=2048, token_len=257),
     )
 
     assert resolution.bucket is None
     assert resolution.reason == "oversize_t"
-    assert resolution.attempted == "S100_T>256_R160"
+    assert resolution.attempted == "S2048_T>256_R160"
 
 
 def test_auto_bucket_oversize_s_returns_reason() -> None:
     resolution = openai_api_server._auto_select_bucket(
-        planning_context(patched_steps=201, token_len=64),
+        planning_context(patched_steps=2049, token_len=256),
     )
 
     assert resolution.bucket is None
     assert resolution.reason == "oversize_s"
-    assert resolution.attempted == "S>200_T64_R160"
+    assert resolution.attempted == "S>2048_T256_R160"
 
 
 def test_tokenize_for_bucket_uses_untruncated_encode_and_stable_hash() -> None:
@@ -177,8 +164,8 @@ def _v2_fingerprint(**overrides: object) -> str:
         "reference_fingerprint": "server_default:/path:sha256:xyz",
         "caption": "neutral",
         "bucket": openai_api_server.CoreMLConditionBucket(
-            sequence_length=100,
-            text_len=64,
+            sequence_length=256,
+            text_len=32,
             speaker_context_len_bucket=160,
         ),
         "cfg": {
@@ -220,7 +207,7 @@ def test_internal_auto_condition_fingerprint_changes_with_text_caption_bucket_cf
     assert (
         _v2_fingerprint(
             bucket=openai_api_server.CoreMLConditionBucket(
-                sequence_length=160,
+                sequence_length=512,
                 text_len=64,
                 speaker_context_len_bucket=160,
             ),
@@ -247,8 +234,8 @@ def test_internal_auto_condition_fingerprint_changes_with_text_caption_bucket_cf
 
 def test_explicit_condition_endpoint_canonical_fingerprint_unchanged() -> None:
     bucket = openai_api_server.CoreMLConditionBucket(
-        sequence_length=100,
-        text_len=64,
+        sequence_length=256,
+        text_len=32,
         speaker_context_len_bucket=160,
     )
     cfg = {
@@ -304,7 +291,7 @@ def test_explicit_irodori_bucket_bypasses_auto_select(
     resolution = openai_api_server._resolve_auto_bucket_resolution(
         {
             "bucket": {
-                "sequence_length": 160,
+                "sequence_length": 512,
                 "text_len": 128,
                 "speaker_context_len": 160,
             },
@@ -315,6 +302,6 @@ def test_explicit_irodori_bucket_bypasses_auto_select(
 
     assert resolution.reason is None
     assert resolution.bucket is not None
-    assert resolution.bucket.sequence_length == 160
+    assert resolution.bucket.sequence_length == 512
     assert resolution.bucket.text_len == 128
     assert resolution.bucket.speaker_context_len_bucket == 160

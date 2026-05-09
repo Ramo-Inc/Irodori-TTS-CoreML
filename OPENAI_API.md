@@ -30,12 +30,26 @@ By default, `rem.wav` must exist next to `openai_api_server.py`. To use a differ
 server-owned reference file, start with `--reference-wav path/to/reference.wav`.
 
 The server estimates the generation horizon from non-whitespace input length, then clamps
-it between `--min-seconds` and `--max-seconds`. Defaults are tuned for short Japanese
-text: `--min-seconds 4`, `--max-seconds 30`, `--chars-per-second 4`, and
-`--seconds-padding 1.5`. This makes short text much faster than the previous fixed 30s
-horizon. Use `--seconds N` to force one fixed horizon for all requests, or send extension
-field `"seconds": N` in one request to override only that request. Request-level
-`seconds` must be between `0.1` and `--max-seconds`.
+it between `--min-seconds` and `--max-seconds`. Defaults are tuned for medium-length
+Japanese text: `--min-seconds 4`, `--max-seconds 70`, `--chars-per-second 4`, and
+`--seconds-padding 1.5`. This lets a single AUTO request cover up to about 256
+non-whitespace characters in one CoreML bucket without splitting. Use `--seconds N` to
+force one fixed horizon for all requests, or send extension field `"seconds": N` in one
+request to override only that request. Request-level `seconds` must be between `0.1`
+and `--max-seconds`.
+
+For AUTO requests, the server selects the smallest CoreML bucket whose
+`(sequence_length, text_len)` covers the request from this preset list:
+`(S=256, T=32)`, `(S=512, T=64)`, `(S=1024, T=128)`, `(S=1536, T=192)`,
+`(S=2048, T=256)`, all with `R=160` for the speaker context bucket. Inputs whose
+estimated `patched_steps` exceed `2048` or whose `token_len` exceeds `256` are split
+near the midpoint at sentence boundaries, then phrase punctuation, then whitespace
+(including the full-width space `　`), then a hard split if no boundary exists.
+After the runtime is loaded, AUTO requests are re-checked with the runtime tokenizer and
+estimator and split further if a chunk still exceeds the bucket maximums. Pass
+`--strict-coreml` to make AUTO requests raise an explicit error instead of silently
+falling back to PyTorch when no usable condition cache can be prepared. `cache_mode=off`
+remains an explicit PyTorch opt-out even when `--strict-coreml` is enabled.
 
 Clients may send OpenAI fields such as `model`, `voice`, `response_format`, and `speed`.
 The `voice` field and client reference fields such as `reference_audio` are accepted for
@@ -126,8 +140,10 @@ caption-conditioned style/control input.
 LaunchAgent autostart:
 
 The project includes [launchd/com.ramo.irodori-tts-openai-api.plist](launchd/com.ramo.irodori-tts-openai-api.plist).
-It runs `/opt/homebrew/bin/uv run python openai_api_server.py --host 0.0.0.0 --port 19841 --model-device mps --codec-device mps`
-from `/Users/ramo/Services/Irodori-TTS`. As a user LaunchAgent, it starts at user login.
+It runs `/opt/homebrew/bin/uv run python openai_api_server.py --host 0.0.0.0 --port 19841 --model-device mps --codec-device mps --preload --strict-coreml --max-seconds 70 --max-resident-speaker-kv-buckets 5` and warms up
+buckets `S=256,T=32,R=160`, `S=512,T=64,R=160`, `S=1024,T=128,R=160`,
+`S=1536,T=192,R=160`, and `S=2048,T=256,R=160` from
+`/Users/ramo/Services/Irodori-TTS`. As a user LaunchAgent, it starts at user login.
 
 ```bash
 mkdir -p logs ~/Library/LaunchAgents

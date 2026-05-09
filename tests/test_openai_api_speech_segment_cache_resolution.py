@@ -410,6 +410,252 @@ def test_many_condition_ids_are_summarized_with_count(
     assert runtime.legacy_requests == []
 
 
+def test_split_text_for_auto_chunks_recursively_splits_oversize_text(
+    settings: ServerSettings,
+) -> None:
+    text = "あ" * 257
+    chunks = openai_api_server._split_text_for_auto_chunks(text, settings)
+    assert chunks
+    assert "".join(chunks) == text
+    char_budget = openai_api_server._speech_chunk_char_budget(settings)
+    for chunk in chunks:
+        assert openai_api_server._count_non_whitespace_chars(chunk) <= char_budget
+
+
+def test_split_text_recursive_prefers_sentence_then_phrase_then_space() -> None:
+    sentence_split = openai_api_server._split_chunk_at_priority_boundary(
+        "あいうえお。かきくけこ、さしすせそ ",
+    )
+    assert sentence_split is not None
+    left, right = sentence_split
+    assert left.endswith("。")
+    assert right.strip()
+
+    phrase_split = openai_api_server._split_chunk_at_priority_boundary(
+        "あいうえお、かきくけこ さしすせそ",
+    )
+    assert phrase_split is not None
+    left, right = phrase_split
+    assert left.endswith("、")
+
+    space_split = openai_api_server._split_chunk_at_priority_boundary(
+        "abcdefg hijklmn",
+    )
+    assert space_split is not None
+    left, right = space_split
+    assert left.endswith(" ")
+
+
+def test_split_text_recursive_handles_full_width_space() -> None:
+    text = "abcdefghij　klmnopqrst"
+    split = openai_api_server._split_chunk_at_priority_boundary(text)
+    assert split is not None
+    left, right = split
+    assert left.endswith("　")
+    assert right.strip() == "klmnopqrst"
+
+
+def test_build_speech_segment_plan_keeps_long_input_under_256_as_single_segment(
+    settings: ServerSettings,
+) -> None:
+    long_settings = openai_api_server.ServerSettings(
+        host=settings.host,
+        port=settings.port,
+        checkpoint=settings.checkpoint,
+        reference_wav=settings.reference_wav,
+        api_model_id=settings.api_model_id,
+        model_device=settings.model_device,
+        codec_device=settings.codec_device,
+        model_precision=settings.model_precision,
+        codec_precision=settings.codec_precision,
+        codec_repo=settings.codec_repo,
+        default_num_steps=settings.default_num_steps,
+        max_num_steps=settings.max_num_steps,
+        seconds=None,
+        min_seconds=settings.min_seconds,
+        max_seconds=70.0,
+        chars_per_second=4.0,
+        seconds_padding=1.5,
+        max_ref_seconds=settings.max_ref_seconds,
+        preload=settings.preload,
+        log_timings=settings.log_timings,
+    )
+    text = "あ" * 256
+    plan = openai_api_server._build_speech_segment_plan({}, text, long_settings)
+    assert len(plan.segments) == 1
+    assert plan.segments[0].text == text
+
+
+def test_build_speech_segment_plan_splits_text_above_256_chars(
+    settings: ServerSettings,
+) -> None:
+    long_settings = openai_api_server.ServerSettings(
+        host=settings.host,
+        port=settings.port,
+        checkpoint=settings.checkpoint,
+        reference_wav=settings.reference_wav,
+        api_model_id=settings.api_model_id,
+        model_device=settings.model_device,
+        codec_device=settings.codec_device,
+        model_precision=settings.model_precision,
+        codec_precision=settings.codec_precision,
+        codec_repo=settings.codec_repo,
+        default_num_steps=settings.default_num_steps,
+        max_num_steps=settings.max_num_steps,
+        seconds=None,
+        min_seconds=settings.min_seconds,
+        max_seconds=70.0,
+        chars_per_second=4.0,
+        seconds_padding=1.5,
+        max_ref_seconds=settings.max_ref_seconds,
+        preload=settings.preload,
+        log_timings=settings.log_timings,
+    )
+    text = ("あ" * 200) + "。" + ("い" * 200)
+    plan = openai_api_server._build_speech_segment_plan({}, text, long_settings)
+    assert len(plan.segments) >= 2
+    rejoined = "".join(segment.text for segment in plan.segments)
+    assert rejoined == text
+    char_budget = openai_api_server._speech_chunk_char_budget(long_settings)
+    for segment in plan.segments:
+        assert openai_api_server._count_non_whitespace_chars(segment.text) <= char_budget
+
+
+def test_runtime_refine_splits_segments_until_token_len_fits(
+    settings: ServerSettings,
+) -> None:
+    class TokenCappedRuntime:
+        def __init__(self) -> None:
+            self.codec = SimpleNamespace(
+                sample_rate=24_000,
+                model=SimpleNamespace(hop_length=512),
+            )
+            self.model_cfg = SimpleNamespace(latent_patch_size=2)
+
+        def estimate_patched_steps(self, seconds: float) -> int:
+            target_samples = int(float(seconds) * int(self.codec.sample_rate))
+            latent_steps = (target_samples + int(self.codec.model.hop_length) - 1) // int(
+                self.codec.model.hop_length
+            )
+            return (latent_steps + int(self.model_cfg.latent_patch_size) - 1) // int(
+                self.model_cfg.latent_patch_size
+            )
+
+        def tokenize_for_bucket(self, normalized_text: str) -> tuple[int, str]:
+            return len(normalized_text), "sha256:fake"
+
+    runtime = TokenCappedRuntime()
+    plan = openai_api_server.SpeechSegmentPlan(
+        segments=(
+            openai_api_server.SpeechSegment(
+                text="A" * 300, seconds=10.0,
+            ),
+        ),
+        total_seconds=10.0,
+        seconds_mode="auto",
+    )
+    refined = openai_api_server._runtime_refine_segment_plan_for_auto(plan, runtime, settings)
+    assert refined is not plan
+    assert len(refined.segments) >= 2
+    for segment in refined.segments:
+        normalized = openai_api_server.normalize_text(segment.text).strip()
+        token_len, _ = runtime.tokenize_for_bucket(normalized)
+        assert token_len <= openai_api_server.AUTO_TEXT_LEN_MAX
+    assert "".join(segment.text for segment in refined.segments) == "A" * 300
+
+
+def test_runtime_refine_keeps_segment_when_split_does_not_reduce_tokens(
+    settings: ServerSettings,
+) -> None:
+    class ConstantTokenRuntime:
+        def __init__(self) -> None:
+            self.codec = SimpleNamespace(
+                sample_rate=24_000,
+                model=SimpleNamespace(hop_length=512),
+            )
+            self.model_cfg = SimpleNamespace(latent_patch_size=2)
+
+        def estimate_patched_steps(self, seconds: float) -> int:
+            del seconds
+            return 50
+
+        def tokenize_for_bucket(self, normalized_text: str) -> tuple[int, str]:
+            del normalized_text
+            return 999, "sha256:fake"
+
+    runtime = ConstantTokenRuntime()
+    segment = openai_api_server.SpeechSegment(text="abc def ghi", seconds=2.0)
+    plan = openai_api_server.SpeechSegmentPlan(
+        segments=(segment,),
+        total_seconds=2.0,
+        seconds_mode="auto",
+    )
+    refined = openai_api_server._runtime_refine_segment_plan_for_auto(plan, runtime, settings)
+    assert refined is plan
+
+
+def test_audio_speech_strict_coreml_with_oversize_t_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    import dataclasses
+
+    runtime = FakeRuntime()
+    strict_settings = dataclasses.replace(settings, strict_coreml=True)
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    def oversize_tokens(text: str) -> tuple[int, str]:
+        del text
+        return 999, "sha256:oversize"
+
+    monkeypatch.setattr(runtime, "tokenize_for_bucket", oversize_tokens)
+
+    with TestClient(create_app(strict_settings)) as client:
+        response = client.post("/v1/audio/speech", json=speech_payload())
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "coreml_backend_unavailable"
+    assert "strict_coreml" in body["error"]["message"]
+    assert runtime.legacy_requests == []
+    assert runtime.fast_requests == []
+
+
+def test_audio_speech_strict_coreml_off_mode_still_uses_pytorch(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    import dataclasses
+
+    runtime = FakeRuntime()
+    strict_settings = dataclasses.replace(settings, strict_coreml=True)
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    with TestClient(create_app(strict_settings)) as client:
+        response = client.post(
+            "/v1/audio/speech",
+            json=speech_payload(irodori={"cache_mode": "off"}),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["X-Irodori-Denoiser-Backend"] == "pytorch"
+    assert "X-Irodori-Cache-Auto" not in response.headers
+    assert len(runtime.legacy_requests) == 1
+    assert runtime.fast_requests == []
+
+
 def test_multi_segment_auto_bucket_planning_runs_off_event_loop(
     client_runtime: tuple[TestClient, FakeRuntime],
     monkeypatch: pytest.MonkeyPatch,
@@ -457,3 +703,91 @@ def test_multi_segment_auto_bucket_planning_runs_off_event_loop(
     assert planned_segments == ["segment 0", "segment 1"]
     assert len(runtime.legacy_requests) == 2
     assert runtime.fast_requests == []
+
+
+def test_request_seconds_plan_skips_runtime_refine_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    import dataclasses
+
+    runtime = FakeRuntime()
+    strict_settings = dataclasses.replace(settings, strict_coreml=True)
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    refine_calls: list[str] = []
+
+    def spy_refine(
+        plan: openai_api_server.SpeechSegmentPlan,
+        _runtime: Any,
+        _settings: ServerSettings,
+    ) -> openai_api_server.SpeechSegmentPlan:
+        refine_calls.append(plan.seconds_mode)
+        return plan
+
+    monkeypatch.setattr(
+        openai_api_server,
+        "_runtime_refine_segment_plan_for_auto",
+        spy_refine,
+    )
+
+    def oversize_tokens(text: str) -> tuple[int, str]:
+        del text
+        return 999, "sha256:oversize"
+
+    monkeypatch.setattr(runtime, "tokenize_for_bucket", oversize_tokens)
+
+    with TestClient(create_app(strict_settings)) as client:
+        response = client.post("/v1/audio/speech", json=speech_payload())
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "coreml_backend_unavailable"
+    assert refine_calls == []
+    assert runtime.legacy_requests == []
+    assert runtime.fast_requests == []
+
+
+def test_runtime_refine_runs_for_auto_seconds_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    runtime = FakeRuntime()
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    refine_calls: list[str] = []
+
+    def spy_refine(
+        plan: openai_api_server.SpeechSegmentPlan,
+        _runtime: Any,
+        _settings: ServerSettings,
+    ) -> openai_api_server.SpeechSegmentPlan:
+        refine_calls.append(plan.seconds_mode)
+        return plan
+
+    monkeypatch.setattr(
+        openai_api_server,
+        "_runtime_refine_segment_plan_for_auto",
+        spy_refine,
+    )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/v1/audio/speech",
+            json=speech_payload(seconds=None),
+        )
+
+    assert response.status_code == 200
+    assert refine_calls == ["auto"]

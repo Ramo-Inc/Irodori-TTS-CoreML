@@ -64,7 +64,7 @@ DEFAULT_API_MODEL_ID = "irodori-tts-500m-v2"
 MODEL_CREATED = 1700000000
 SUPPORTED_RESPONSE_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
 SECONDS_ROUND_INCREMENT = 0.5
-MAX_SAFE_SEGMENT_SECONDS = 30.0
+MAX_SAFE_SEGMENT_SECONDS = 70.0
 CACHE_MODE_CREATE_OR_REUSE = "create_or_reuse"
 CACHE_MANAGER_REFRESH_MODE = "refresh"
 CACHE_CREATE_MODES = {CACHE_MODE_CREATE_OR_REUSE, CACHE_MANAGER_REFRESH_MODE}
@@ -83,8 +83,15 @@ CONDITION_CFG_WINDOW_DEFAULTS = {
     "min_t": 0.5,
     "max_t": 1.0,
 }
-AUTO_SEQUENCE_LENGTH_BUCKETS = (100, 160, 200)
-AUTO_TEXT_LEN_BUCKETS = (64, 128, 256)
+AUTO_BUCKET_PRESETS: tuple[tuple[int, int], ...] = (
+    (256, 32),
+    (512, 64),
+    (1024, 128),
+    (1536, 192),
+    (2048, 256),
+)
+AUTO_SEQUENCE_LENGTH_MAX = AUTO_BUCKET_PRESETS[-1][0]
+AUTO_TEXT_LEN_MAX = AUTO_BUCKET_PRESETS[-1][1]
 AUTO_SPEAKER_CONTEXT_LEN_BUCKET = 160
 _MISSING = object()
 
@@ -270,6 +277,18 @@ def _cache_error_response(
         cache_mode=cache_mode,
     )
     return JSONResponse(status_code=error.status_code, content=error.payload)
+
+
+def _strict_auto_unavailable_reason(resolution: _SpeechCacheResolution) -> str:
+    parts: list[str] = []
+    if resolution.fallback_reason:
+        parts.append(f"reason={resolution.fallback_reason}")
+    if resolution.auto_status:
+        parts.append(f"auto_status={resolution.auto_status}")
+    if resolution.bucket is not None:
+        parts.append(f"bucket={_bucket_header_value(resolution.bucket)}")
+    detail = ", ".join(parts) if parts else "no condition cache available"
+    return f"strict_coreml: AUTO request without usable condition cache ({detail})"
 
 
 def _coreml_backend_error_response(
@@ -856,41 +875,39 @@ def _auto_bucket_attempted(
     sequence_length: int | None,
     text_len: int | None,
 ) -> str:
-    s_value = str(sequence_length) if sequence_length is not None else ">200"
-    t_value = str(text_len) if text_len is not None else ">256"
+    s_value = str(sequence_length) if sequence_length is not None else f">{AUTO_SEQUENCE_LENGTH_MAX}"
+    t_value = str(text_len) if text_len is not None else f">{AUTO_TEXT_LEN_MAX}"
     return f"S{s_value}_T{t_value}_R{AUTO_SPEAKER_CONTEXT_LEN_BUCKET}"
 
 
-def _smallest_sufficient_bucket(value: int, buckets: tuple[int, ...]) -> int | None:
-    for bucket in buckets:
-        if int(value) <= int(bucket):
-            return int(bucket)
+def _select_auto_preset(
+    patched_steps: int,
+    token_len: int,
+) -> tuple[int, int] | None:
+    for sequence_length, text_len in AUTO_BUCKET_PRESETS:
+        if int(patched_steps) <= int(sequence_length) and int(token_len) <= int(text_len):
+            return int(sequence_length), int(text_len)
     return None
 
 
 def _auto_select_bucket(planning: AutoSpeechPlanningContext) -> AutoBucketResolution:
-    sequence_length = _smallest_sufficient_bucket(
+    preset = _select_auto_preset(
         int(planning.patched_steps),
-        AUTO_SEQUENCE_LENGTH_BUCKETS,
-    )
-    text_len = _smallest_sufficient_bucket(
         int(planning.token_len),
-        AUTO_TEXT_LEN_BUCKETS,
     )
-    if sequence_length is None:
+    if preset is None:
+        oversize_s = int(planning.patched_steps) > AUTO_SEQUENCE_LENGTH_MAX
+        oversize_t = int(planning.token_len) > AUTO_TEXT_LEN_MAX
+        sequence_length: int | None = None if oversize_s else AUTO_SEQUENCE_LENGTH_MAX
+        text_len: int | None = None if oversize_t else AUTO_TEXT_LEN_MAX
+        reason = "oversize_s" if oversize_s else "oversize_t"
         return AutoBucketResolution(
             bucket=None,
-            reason="oversize_s",
+            reason=reason,
             attempted=_auto_bucket_attempted(sequence_length, text_len),
             planning=planning,
         )
-    if text_len is None:
-        return AutoBucketResolution(
-            bucket=None,
-            reason="oversize_t",
-            attempted=_auto_bucket_attempted(sequence_length, text_len),
-            planning=planning,
-        )
+    sequence_length, text_len = preset
     return AutoBucketResolution(
         bucket=CoreMLConditionBucket(
             sequence_length=sequence_length,
@@ -1867,103 +1884,82 @@ def _estimate_generation_seconds(text: str, settings: ServerSettings) -> float:
     return min(max(rounded, float(settings.min_seconds)), _effective_segment_max_seconds(settings))
 
 
+SEGMENT_MAX_NON_WHITESPACE_CHARS = 256
+PRIMARY_BOUNDARY_CHARS: frozenset[str] = frozenset({"\n", "\r", "。", "！", "？", "!", "?"})
+SECONDARY_BOUNDARY_CHARS: frozenset[str] = frozenset(
+    {"、", "，", ",", "；", ";", "：", ":"},
+)
+
+
 def _speech_chunk_char_budget(settings: ServerSettings) -> int:
     segment_max_seconds = _effective_segment_max_seconds(settings)
     usable_seconds = max(0.0, segment_max_seconds - float(settings.seconds_padding))
-    budget = int(math.floor(usable_seconds * float(settings.chars_per_second) * 0.9))
-    return max(20, budget)
+    budget = int(math.floor(usable_seconds * float(settings.chars_per_second)))
+    return max(20, min(SEGMENT_MAX_NON_WHITESPACE_CHARS, budget))
 
 
-def _split_at_boundaries(text: str, boundaries: set[str]) -> list[str]:
-    parts: list[str] = []
-    buffer: list[str] = []
-    for char in text:
-        buffer.append(char)
-        if char in boundaries:
-            part = "".join(buffer)
-            if part.strip():
-                parts.append(part)
-            buffer = []
-    part = "".join(buffer)
-    if part.strip():
-        parts.append(part)
-    return parts
+def _split_chunk_at_priority_boundary(text: str) -> tuple[str, str] | None:
+    n = len(text)
+    if n <= 1:
+        return None
+    midpoint = n // 2
 
+    def _scan(predicate) -> int | None:
+        best_index: int | None = None
+        best_distance: int | None = None
+        for index, char in enumerate(text):
+            if index >= n - 1:
+                break
+            if not predicate(char):
+                continue
+            distance = abs(index - midpoint)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
 
-def _split_at_secondary_boundaries(text: str) -> list[str]:
-    parts: list[str] = []
-    buffer: list[str] = []
-    for char in text:
-        buffer.append(char)
-        if char in {"、", "，", ",", "；", ";", "：", ":"} or char.isspace():
-            part = "".join(buffer)
-            if part.strip():
-                parts.append(part)
-            buffer = []
-    part = "".join(buffer)
-    if part.strip():
-        parts.append(part)
-    return parts
-
-
-def _hard_split_by_char_budget(text: str, char_budget: int) -> list[str]:
-    parts: list[str] = []
-    buffer: list[str] = []
-    char_count = 0
-    for char in text:
-        char_weight = 0 if char.isspace() else 1
-        if buffer and char_count + char_weight > char_budget:
-            part = "".join(buffer).strip()
-            if part:
-                parts.append(part)
-            buffer = []
-            char_count = 0
-        buffer.append(char)
-        char_count += char_weight
-    part = "".join(buffer).strip()
-    if part:
-        parts.append(part)
-    return parts
-
-
-def _pack_text_chunks(parts: list[str], char_budget: int) -> list[str]:
-    chunks: list[str] = []
-    current = ""
-    for part in parts:
-        if not part.strip():
+    candidate_predicates = (
+        lambda ch: ch in PRIMARY_BOUNDARY_CHARS,
+        lambda ch: ch in SECONDARY_BOUNDARY_CHARS,
+        lambda ch: ch.isspace() and ch not in PRIMARY_BOUNDARY_CHARS,
+    )
+    for predicate in candidate_predicates:
+        index = _scan(predicate)
+        if index is None:
             continue
-        candidate = f"{current}{part}" if current else part
-        if current and _count_non_whitespace_chars(candidate) > char_budget:
-            chunk = current.strip()
-            if chunk:
-                chunks.append(chunk)
-            current = part
-        else:
-            current = candidate
+        left, right = text[: index + 1], text[index + 1 :]
+        if left.strip() and right.strip():
+            return left, right
+    return None
 
-    chunk = current.strip()
-    if chunk:
-        chunks.append(chunk)
-    return chunks
+
+def _split_text_recursive_by_char_budget(text: str, char_budget: int) -> list[str]:
+    if text == "":
+        return []
+    if _count_non_whitespace_chars(text) <= char_budget:
+        stripped = text.strip()
+        return [stripped] if stripped else []
+
+    split = _split_chunk_at_priority_boundary(text)
+    if split is None:
+        n = len(text)
+        if n <= 1:
+            stripped = text.strip()
+            return [stripped] if stripped else []
+        mid = n // 2
+        left_text, right_text = text[:mid], text[mid:]
+    else:
+        left_text, right_text = split
+
+    out: list[str] = []
+    out.extend(_split_text_recursive_by_char_budget(left_text, char_budget))
+    out.extend(_split_text_recursive_by_char_budget(right_text, char_budget))
+    return out
 
 
 def _split_text_for_auto_chunks(text: str, settings: ServerSettings) -> list[str]:
     char_budget = _speech_chunk_char_budget(settings)
-    sentence_parts = _split_at_boundaries(text, {"。", "！", "？", "!", "?", "\n", "\r"})
-    small_parts: list[str] = []
-
-    for sentence in sentence_parts:
-        if _count_non_whitespace_chars(sentence) <= char_budget:
-            small_parts.append(sentence)
-            continue
-
-        for part in _split_at_secondary_boundaries(sentence):
-            if _count_non_whitespace_chars(part) <= char_budget:
-                small_parts.append(part)
-            else:
-                small_parts.extend(_hard_split_by_char_budget(part, char_budget))
-
-    return _pack_text_chunks(small_parts, char_budget)
+    return _split_text_recursive_by_char_budget(text, char_budget)
 
 
 def _build_speech_segment_plan(
@@ -1987,8 +1983,12 @@ def _build_speech_segment_plan(
         seconds = min(float(settings.seconds), segment_max_seconds)
         return SpeechSegmentPlan((SpeechSegment(text=text, seconds=seconds),), seconds, "fixed")
 
+    char_budget = _speech_chunk_char_budget(settings)
     uncapped_seconds = _estimate_generation_seconds_uncapped(text, settings)
-    if uncapped_seconds <= segment_max_seconds:
+    if (
+        _count_non_whitespace_chars(text) <= char_budget
+        and uncapped_seconds <= segment_max_seconds
+    ):
         seconds = _estimate_generation_seconds(text, settings)
         return SpeechSegmentPlan((SpeechSegment(text=text, seconds=seconds),), seconds, "auto")
 
@@ -2004,6 +2004,91 @@ def _build_speech_segment_plan(
     seconds_mode = "auto-chunked" if len(segments) > 1 else "auto"
     total_seconds = sum(segment.seconds for segment in segments)
     return SpeechSegmentPlan(segments, total_seconds, seconds_mode)
+
+
+def _segment_fits_runtime_limits(
+    segment: SpeechSegment,
+    runtime: Any,
+) -> tuple[bool, str | None]:
+    normalized = normalize_text(segment.text).strip()
+    if normalized == "":
+        return True, None
+    token_len, _ = runtime.tokenize_for_bucket(normalized)
+    if int(token_len) > AUTO_TEXT_LEN_MAX:
+        return False, "oversize_t"
+    if int(runtime.estimate_patched_steps(float(segment.seconds))) > AUTO_SEQUENCE_LENGTH_MAX:
+        return False, "oversize_s"
+    return True, None
+
+
+def _runtime_split_segment_recursive(
+    segment: SpeechSegment,
+    runtime: Any,
+    settings: ServerSettings,
+) -> list[SpeechSegment]:
+    if segment.text.strip() == "":
+        return []
+    fits, _ = _segment_fits_runtime_limits(segment, runtime)
+    if fits:
+        return [segment]
+
+    parent_normalized = normalize_text(segment.text).strip()
+    parent_token_len: int | None = None
+    if parent_normalized:
+        parent_tokens, _ = runtime.tokenize_for_bucket(parent_normalized)
+        parent_token_len = int(parent_tokens)
+
+    split = _split_chunk_at_priority_boundary(segment.text)
+    if split is None:
+        n = len(segment.text)
+        if n <= 1:
+            return [segment]
+        mid = n // 2
+        left_text, right_text = segment.text[:mid], segment.text[mid:]
+    else:
+        left_text, right_text = split
+    if not left_text.strip() or not right_text.strip():
+        return [segment]
+
+    if parent_token_len is not None:
+        left_normalized = normalize_text(left_text).strip()
+        if left_normalized:
+            left_tokens, _ = runtime.tokenize_for_bucket(left_normalized)
+            if int(left_tokens) >= parent_token_len:
+                return [segment]
+
+    left_segment = SpeechSegment(
+        text=left_text.strip(),
+        seconds=_estimate_generation_seconds(left_text, settings),
+    )
+    right_segment = SpeechSegment(
+        text=right_text.strip(),
+        seconds=_estimate_generation_seconds(right_text, settings),
+    )
+    refined: list[SpeechSegment] = []
+    refined.extend(_runtime_split_segment_recursive(left_segment, runtime, settings))
+    refined.extend(_runtime_split_segment_recursive(right_segment, runtime, settings))
+    return refined
+
+
+def _runtime_refine_segment_plan_for_auto(
+    plan: SpeechSegmentPlan,
+    runtime: Any,
+    settings: ServerSettings,
+) -> SpeechSegmentPlan:
+    refined: list[SpeechSegment] = []
+    for segment in plan.segments:
+        refined.extend(_runtime_split_segment_recursive(segment, runtime, settings))
+    if not refined:
+        return plan
+    if len(refined) == len(plan.segments) and all(
+        new.text == old.text and new.seconds == old.seconds
+        for new, old in zip(refined, plan.segments, strict=True)
+    ):
+        return plan
+    seconds_mode = "auto-chunked" if len(refined) > 1 else plan.seconds_mode
+    total_seconds = sum(segment.seconds for segment in refined)
+    return SpeechSegmentPlan(tuple(refined), total_seconds, seconds_mode)
 
 
 def _resolve_generation_seconds(
@@ -2456,6 +2541,19 @@ def create_app(settings: ServerSettings) -> FastAPI:
             if runtime is None:
                 runtime = await asyncio.to_thread(state.get_runtime)
             if cache_mode == CACHE_MODE_AUTO and cache_id is None:
+                if segment_plan.seconds_mode.startswith("auto"):
+                    refined_plan = await asyncio.to_thread(
+                        _runtime_refine_segment_plan_for_auto,
+                        segment_plan,
+                        runtime,
+                        settings,
+                    )
+                    if refined_plan is not segment_plan:
+                        segment_plan = refined_plan
+                        cache_resolutions = [
+                            _SpeechCacheResolution(None, None, False, False)
+                            for _segment in segment_plan.segments
+                        ]
                 auto_bucket_resolutions = await asyncio.to_thread(
                     _resolve_auto_bucket_resolutions,
                     irodori,
@@ -2519,6 +2617,10 @@ def create_app(settings: ServerSettings) -> FastAPI:
                     )
 
                 if condition_cache_handle is None:
+                    if cache_mode == CACHE_MODE_AUTO and settings.strict_coreml:
+                        raise CoreMLStatefulUnavailableError(
+                            _strict_auto_unavailable_reason(cache_resolution),
+                        )
                     result = await asyncio.to_thread(
                         runtime.synthesize,
                         sampling_request,
@@ -2721,7 +2823,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fixed generation horizon for every request. If omitted, seconds are estimated from input length.",
     )
     parser.add_argument("--min-seconds", type=float, default=4.0)
-    parser.add_argument("--max-seconds", type=float, default=30.0)
+    parser.add_argument("--max-seconds", type=float, default=70.0)
     parser.add_argument("--chars-per-second", type=float, default=4.0)
     parser.add_argument("--seconds-padding", type=float, default=1.5)
     parser.add_argument(

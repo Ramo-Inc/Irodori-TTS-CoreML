@@ -46,6 +46,14 @@ def test_cli_defaults_match_server_settings_defaults() -> None:
     assert settings.enable_resident_reference_cache is True
     assert settings.enable_resident_speaker_kv is True
     assert settings.enable_condition_packed_kv_cache is False
+    assert settings.max_seconds == pytest.approx(70.0)
+
+
+def test_cli_max_seconds_safe_cap_matches_default() -> None:
+    assert openai_api_server.MAX_SAFE_SEGMENT_SECONDS == pytest.approx(70.0)
+    args = parse_args([])
+    settings = build_settings_from_args(args)
+    assert openai_api_server._effective_segment_max_seconds(settings) == pytest.approx(70.0)
 
 
 def test_cli_no_auto_prepare_default_cache_flag_disables_setting() -> None:

@@ -265,7 +265,7 @@ def test_no_irodori_defaults_to_auto_prepare_with_coreml_stateful(
     assert response.status_code == 200
     assert response.headers["X-Irodori-Denoiser-Backend"] == "coreml-stateful"
     assert response.headers["X-Irodori-Cache-Auto"] == "prepared"
-    assert response.headers["X-Irodori-Bucket"] == "S100_T64_R160"
+    assert response.headers["X-Irodori-Bucket"] == "S256_T32_R160"
     assert response.headers["X-Irodori-Condition-Cache-Id"].startswith("cond_")
     assert response.headers["X-Irodori-Reference-Cache-Id"].startswith("ref_")
     assert "X-Irodori-Fallback-Reason" not in response.headers

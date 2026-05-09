@@ -20,12 +20,21 @@
     <string>--codec-device</string>
     <string>mps</string>
     <string>--preload</string>
+    <string>--strict-coreml</string>
+    <string>--max-seconds</string>
+    <string>70</string>
+    <string>--max-resident-speaker-kv-buckets</string>
+    <string>5</string>
     <string>--warmup-bucket</string>
-    <string>S=100,T=256,R=160</string>
+    <string>S=256,T=32,R=160</string>
     <string>--warmup-bucket</string>
-    <string>S=160,T=256,R=160</string>
+    <string>S=512,T=64,R=160</string>
     <string>--warmup-bucket</string>
-    <string>S=200,T=256,R=160</string>
+    <string>S=1024,T=128,R=160</string>
+    <string>--warmup-bucket</string>
+    <string>S=1536,T=192,R=160</string>
+    <string>--warmup-bucket</string>
+    <string>S=2048,T=256,R=160</string>
   </array>
 
   <key>WorkingDirectory</key>

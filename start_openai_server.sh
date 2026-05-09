@@ -10,7 +10,12 @@ exec uv run python openai_api_server.py \
   --host "$IRODORI_TTS_HOST" \
   --port "$IRODORI_TTS_PORT" \
   --preload \
-  --warmup-bucket S=100,T=256,R=160 \
-  --warmup-bucket S=160,T=256,R=160 \
-  --warmup-bucket S=200,T=256,R=160 \
+  --strict-coreml \
+  --max-seconds 70 \
+  --max-resident-speaker-kv-buckets 5 \
+  --warmup-bucket S=256,T=32,R=160 \
+  --warmup-bucket S=512,T=64,R=160 \
+  --warmup-bucket S=1024,T=128,R=160 \
+  --warmup-bucket S=1536,T=192,R=160 \
+  --warmup-bucket S=2048,T=256,R=160 \
   "$@"
