@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,7 @@ DEFAULT_NUM_LAYERS = 12
 DEFAULT_NUM_HEADS = 20
 DEFAULT_HEAD_DIM = 64
 FP16_BYTES = 2
+_PREPARE_LOCK_STRIPE_COUNT = 64
 
 
 class CacheNotFoundError(Exception):
@@ -785,14 +787,28 @@ def _condition_cache_id(request: ConditionCacheRequest) -> str:
     )
 
 
+def _prepare_lock_stripe_index(cache_id: str, stripe_count: int) -> int:
+    digest = hashlib.sha256(cache_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % stripe_count
+
+
 class InMemoryCoreMLCacheManager:
     def __init__(
         self,
         clock: Callable[[], datetime] | None = None,
         *,
         max_memory_bytes: int | None = None,
+        on_reference_removed: Callable[[str], None] | None = None,
     ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._on_reference_removed = on_reference_removed
+        self._manager_lock = threading.RLock()
+        self._reference_prepare_locks = tuple(
+            threading.RLock() for _ in range(_PREPARE_LOCK_STRIPE_COUNT)
+        )
+        self._condition_prepare_locks = tuple(
+            threading.RLock() for _ in range(_PREPARE_LOCK_STRIPE_COUNT)
+        )
         self._reference_caches: dict[str, ReferenceCacheHandle] = {}
         self._condition_caches: dict[str, ConditionCacheHandle] = {}
         if max_memory_bytes is not None and (
@@ -819,39 +835,44 @@ class InMemoryCoreMLCacheManager:
         self._validate_reference_request(request)
         self._validate_cache_mode(cache_mode)
 
-        now = self._now()
         cache_id = _reference_cache_id(request)
-        existing = self._reference_caches.get(cache_id)
-        if (
-            cache_mode == "create_or_reuse"
-            and existing is not None
-            and not self._is_expired(existing, now)
-        ):
-            return CacheCreateResult(handle=existing, reused=True)
+        with self._reference_prepare_lock(cache_id):
+            with self._manager_lock:
+                now = self._now()
+                existing = self._reference_caches.get(cache_id)
+                if (
+                    cache_mode == "create_or_reuse"
+                    and existing is not None
+                    and not self._is_expired(existing, now)
+                ):
+                    return CacheCreateResult(handle=existing, reused=True)
 
-        if existing is not None:
-            self._delete_conditions_for_reference(cache_id)
+                if existing is not None:
+                    self._delete_conditions_for_reference(cache_id)
 
-        handle = ReferenceCacheHandle(
-            id=cache_id,
-            model_fingerprint=request.model_fingerprint,
-            codec_fingerprint=request.codec_fingerprint,
-            reference_fingerprint=request.reference_fingerprint,
-            speaker_context_len=request.speaker_context_len,
-            model=request.model,
-            ref_len=request.ref_len,
-            speaker_dim=request.speaker_dim,
-            created_at=now,
-            expires_at=_expires_at(now, request.ttl_seconds),
-            memory_bytes=request.memory_bytes,
-            memory_bytes_estimated=request.memory_bytes_estimated,
-            resident_layers=tuple(request.resident_layers),
-            resident_buckets=tuple(request.resident_buckets),
-            metadata=_copy_metadata(request.metadata),
-        )
-        self._reference_caches[cache_id] = handle
-        self._evict_to_memory_budget(protected_reference_id=cache_id, protected_condition_id=None)
-        return CacheCreateResult(handle=handle, reused=False)
+                handle = ReferenceCacheHandle(
+                    id=cache_id,
+                    model_fingerprint=request.model_fingerprint,
+                    codec_fingerprint=request.codec_fingerprint,
+                    reference_fingerprint=request.reference_fingerprint,
+                    speaker_context_len=request.speaker_context_len,
+                    model=request.model,
+                    ref_len=request.ref_len,
+                    speaker_dim=request.speaker_dim,
+                    created_at=now,
+                    expires_at=_expires_at(now, request.ttl_seconds),
+                    memory_bytes=request.memory_bytes,
+                    memory_bytes_estimated=request.memory_bytes_estimated,
+                    resident_layers=tuple(request.resident_layers),
+                    resident_buckets=tuple(request.resident_buckets),
+                    metadata=_copy_metadata(request.metadata),
+                )
+                self._reference_caches[cache_id] = handle
+                self._evict_to_memory_budget(
+                    protected_reference_id=cache_id,
+                    protected_condition_id=None,
+                )
+                return CacheCreateResult(handle=handle, reused=False)
 
     def prepare_condition_cache(
         self,
@@ -861,79 +882,85 @@ class InMemoryCoreMLCacheManager:
         self._validate_condition_request(request)
         self._validate_cache_mode(cache_mode)
 
-        now = self._now()
-        reference = self._reference_caches.get(request.reference_cache_id)
-        if reference is None:
-            raise CacheNotFoundError(f"reference cache not found: {request.reference_cache_id}")
-        self._raise_if_expired(reference, now, "reference")
-        if request.model_fingerprint != reference.model_fingerprint:
-            raise CacheConflictError("model_fingerprint conflicts with reference cache")
-        if request.speaker_context_len != reference.speaker_context_len:
-            raise CacheConflictError("speaker_context_len conflicts with reference cache")
-
         cache_id = _condition_cache_id(request)
-        existing = self._condition_caches.get(cache_id)
-        if (
-            cache_mode == "create_or_reuse"
-            and existing is not None
-            and not self._is_expired(existing, now)
-        ):
-            self._record_resident_bucket(reference, existing.bucket_id)
-            return CacheCreateResult(handle=existing, reused=True)
+        with self._condition_prepare_lock(cache_id):
+            with self._manager_lock:
+                now = self._now()
+                reference = self._reference_caches.get(request.reference_cache_id)
+                if reference is None:
+                    raise CacheNotFoundError(
+                        f"reference cache not found: {request.reference_cache_id}"
+                    )
+                self._raise_if_expired(reference, now, "reference")
+                if request.model_fingerprint != reference.model_fingerprint:
+                    raise CacheConflictError("model_fingerprint conflicts with reference cache")
+                if request.speaker_context_len != reference.speaker_context_len:
+                    raise CacheConflictError("speaker_context_len conflicts with reference cache")
 
-        branch_layouts = tuple(request.branch_layouts)
-        state_copies = int(request.state_copies)
-        handle = ConditionCacheHandle(
-            id=cache_id,
-            reference_cache_id=request.reference_cache_id,
-            model_fingerprint=request.model_fingerprint,
-            tokenizer_fingerprint=request.tokenizer_fingerprint,
-            condition_fingerprint=request.condition_fingerprint,
-            bucket_id=request.bucket.bucket_id(branch_layouts[-1]),
-            sequence_length=request.bucket.sequence_length,
-            text_len=request.bucket.text_len,
-            speaker_context_len=request.speaker_context_len,
-            speaker_context_len_bucket=request.bucket.speaker_context_len_bucket,
-            c_ctx_bucket=request.bucket.c_ctx_bucket,
-            branch_layouts=branch_layouts,
-            mlstate_keys=expected_per_layer_state_names(),
-            created_at=now,
-            expires_at=_expires_at(now, request.ttl_seconds),
-            memory_bytes=kv_memory_bytes(request.bucket, branch_layouts) * state_copies,
-            metadata=_copy_metadata(request.metadata),
-            state_copies=state_copies,
-        )
-        self._condition_caches[cache_id] = handle
-        self._record_resident_bucket(reference, handle.bucket_id)
-        self._evict_to_memory_budget(
-            protected_reference_id=request.reference_cache_id,
-            protected_condition_id=cache_id,
-        )
-        return CacheCreateResult(handle=handle, reused=False)
+                existing = self._condition_caches.get(cache_id)
+                if (
+                    cache_mode == "create_or_reuse"
+                    and existing is not None
+                    and not self._is_expired(existing, now)
+                ):
+                    self._record_resident_bucket(reference, existing.bucket_id)
+                    return CacheCreateResult(handle=existing, reused=True)
+
+                branch_layouts = tuple(request.branch_layouts)
+                state_copies = int(request.state_copies)
+                handle = ConditionCacheHandle(
+                    id=cache_id,
+                    reference_cache_id=request.reference_cache_id,
+                    model_fingerprint=request.model_fingerprint,
+                    tokenizer_fingerprint=request.tokenizer_fingerprint,
+                    condition_fingerprint=request.condition_fingerprint,
+                    bucket_id=request.bucket.bucket_id(branch_layouts[-1]),
+                    sequence_length=request.bucket.sequence_length,
+                    text_len=request.bucket.text_len,
+                    speaker_context_len=request.speaker_context_len,
+                    speaker_context_len_bucket=request.bucket.speaker_context_len_bucket,
+                    c_ctx_bucket=request.bucket.c_ctx_bucket,
+                    branch_layouts=branch_layouts,
+                    mlstate_keys=expected_per_layer_state_names(),
+                    created_at=now,
+                    expires_at=_expires_at(now, request.ttl_seconds),
+                    memory_bytes=kv_memory_bytes(request.bucket, branch_layouts) * state_copies,
+                    metadata=_copy_metadata(request.metadata),
+                    state_copies=state_copies,
+                )
+                self._condition_caches[cache_id] = handle
+                self._record_resident_bucket(reference, handle.bucket_id)
+                self._evict_to_memory_budget(
+                    protected_reference_id=request.reference_cache_id,
+                    protected_condition_id=cache_id,
+                )
+                return CacheCreateResult(handle=handle, reused=False)
 
     def get_reference_cache(self, cache_id: str) -> ReferenceCacheHandle:
         _validate_non_empty_string("cache_id", cache_id)
-        now = self._now()
-        handle = self._reference_caches.get(cache_id)
-        if handle is None:
-            self._metrics["reference_misses"] += 1
-            raise CacheNotFoundError(f"reference cache not found: {cache_id}")
-        if self._is_expired(handle, now):
-            self._metrics["reference_misses"] += 1
-            raise CacheExpiredError(f"reference cache expired: {handle.id}")
-        self._metrics["reference_hits"] += 1
-        self._record_hit(handle, now)
-        return handle
+        with self._manager_lock:
+            now = self._now()
+            handle = self._reference_caches.get(cache_id)
+            if handle is None:
+                self._metrics["reference_misses"] += 1
+                raise CacheNotFoundError(f"reference cache not found: {cache_id}")
+            if self._is_expired(handle, now):
+                self._metrics["reference_misses"] += 1
+                raise CacheExpiredError(f"reference cache expired: {handle.id}")
+            self._metrics["reference_hits"] += 1
+            self._record_hit(handle, now)
+            return handle
 
     def peek_reference_cache(self, cache_id: str) -> ReferenceCacheHandle:
         _validate_non_empty_string("cache_id", cache_id)
-        now = self._now()
-        handle = self._reference_caches.get(cache_id)
-        if handle is None:
-            raise CacheNotFoundError(f"reference cache not found: {cache_id}")
-        if self._is_expired(handle, now):
-            raise CacheExpiredError(f"reference cache expired: {handle.id}")
-        return handle
+        with self._manager_lock:
+            now = self._now()
+            handle = self._reference_caches.get(cache_id)
+            if handle is None:
+                raise CacheNotFoundError(f"reference cache not found: {cache_id}")
+            if self._is_expired(handle, now):
+                raise CacheExpiredError(f"reference cache expired: {handle.id}")
+            return handle
 
     def reference_cache_id_for_request(self, request: ReferenceCacheRequest) -> str:
         self._validate_reference_request(request)
@@ -941,62 +968,70 @@ class InMemoryCoreMLCacheManager:
 
     def get_condition_cache(self, cache_id: str) -> ConditionCacheHandle:
         _validate_non_empty_string("cache_id", cache_id)
-        now = self._now()
-        handle = self._condition_caches.get(cache_id)
-        if handle is None:
-            self._metrics["condition_misses"] += 1
-            raise CacheNotFoundError(f"condition cache not found: {cache_id}")
-        if self._is_expired(handle, now):
-            self._metrics["condition_misses"] += 1
-            raise CacheExpiredError(f"condition cache expired: {handle.id}")
-        reference = self._reference_caches.get(handle.reference_cache_id)
-        if reference is None:
-            self._metrics["condition_misses"] += 1
-            raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
-        if self._is_expired(reference, now):
-            self._metrics["condition_misses"] += 1
-            raise CacheExpiredError(f"reference cache expired: {reference.id}")
-        self._metrics["condition_hits"] += 1
-        self._record_hit(handle, now)
-        return handle
+        with self._manager_lock:
+            now = self._now()
+            handle = self._condition_caches.get(cache_id)
+            if handle is None:
+                self._metrics["condition_misses"] += 1
+                raise CacheNotFoundError(f"condition cache not found: {cache_id}")
+            if self._is_expired(handle, now):
+                self._metrics["condition_misses"] += 1
+                raise CacheExpiredError(f"condition cache expired: {handle.id}")
+            reference = self._reference_caches.get(handle.reference_cache_id)
+            if reference is None:
+                self._metrics["condition_misses"] += 1
+                raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
+            if self._is_expired(reference, now):
+                self._metrics["condition_misses"] += 1
+                raise CacheExpiredError(f"reference cache expired: {reference.id}")
+            self._metrics["condition_hits"] += 1
+            self._record_hit(handle, now)
+            return handle
 
     def peek_condition_cache(self, cache_id: str) -> ConditionCacheHandle:
         _validate_non_empty_string("cache_id", cache_id)
-        now = self._now()
-        handle = self._condition_caches.get(cache_id)
-        if handle is None:
-            raise CacheNotFoundError(f"condition cache not found: {cache_id}")
-        if self._is_expired(handle, now):
-            raise CacheExpiredError(f"condition cache expired: {handle.id}")
-        reference = self._reference_caches.get(handle.reference_cache_id)
-        if reference is None:
-            raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
-        if self._is_expired(reference, now):
-            raise CacheExpiredError(f"reference cache expired: {reference.id}")
-        return handle
+        with self._manager_lock:
+            now = self._now()
+            handle = self._condition_caches.get(cache_id)
+            if handle is None:
+                raise CacheNotFoundError(f"condition cache not found: {cache_id}")
+            if self._is_expired(handle, now):
+                raise CacheExpiredError(f"condition cache expired: {handle.id}")
+            reference = self._reference_caches.get(handle.reference_cache_id)
+            if reference is None:
+                raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
+            if self._is_expired(reference, now):
+                raise CacheExpiredError(f"reference cache expired: {reference.id}")
+            return handle
 
     def delete_reference_cache(self, cache_id: str, cascade: bool = True) -> bool:
         _validate_non_empty_string("cache_id", cache_id)
-        if cache_id not in self._reference_caches:
-            return False
+        removed = False
+        with self._manager_lock:
+            if cache_id not in self._reference_caches:
+                return False
 
-        dependent_condition_ids = self._condition_ids_for_reference(cache_id)
-        if dependent_condition_ids and not cascade:
-            raise CacheConflictError("reference cache has dependent condition caches")
+            dependent_condition_ids = self._condition_ids_for_reference(cache_id)
+            if dependent_condition_ids and not cascade:
+                raise CacheConflictError("reference cache has dependent condition caches")
 
-        for condition_id in dependent_condition_ids:
-            del self._condition_caches[condition_id]
-        del self._reference_caches[cache_id]
+            for condition_id in dependent_condition_ids:
+                del self._condition_caches[condition_id]
+            del self._reference_caches[cache_id]
+            removed = True
+        if removed:
+            self._notify_reference_removed(cache_id)
         return True
 
     def delete_condition_cache(self, cache_id: str) -> bool:
         _validate_non_empty_string("cache_id", cache_id)
-        handle = self._condition_caches.get(cache_id)
-        if handle is None:
-            return False
-        del self._condition_caches[cache_id]
-        self._prune_resident_bucket_if_unused(handle.reference_cache_id, handle.bucket_id)
-        return True
+        with self._manager_lock:
+            handle = self._condition_caches.get(cache_id)
+            if handle is None:
+                return False
+            del self._condition_caches[cache_id]
+            self._prune_resident_bucket_if_unused(handle.reference_cache_id, handle.bucket_id)
+            return True
 
     def _prune_resident_bucket_if_unused(self, reference_cache_id: str, bucket_id: str) -> None:
         reference = self._reference_caches.get(reference_cache_id)
@@ -1021,99 +1056,102 @@ class InMemoryCoreMLCacheManager:
         _validate_non_empty_string("cache_id", cache_id)
         self._validate_condition_request(expected_request)
 
-        now = self._now()
-        handle = self._condition_caches.get(cache_id)
-        if handle is None:
-            raise CacheNotFoundError(f"condition cache not found: {cache_id}")
-        self._raise_if_expired(handle, now, "condition")
+        with self._manager_lock:
+            now = self._now()
+            handle = self._condition_caches.get(cache_id)
+            if handle is None:
+                raise CacheNotFoundError(f"condition cache not found: {cache_id}")
+            self._raise_if_expired(handle, now, "condition")
 
-        reference = self._reference_caches.get(handle.reference_cache_id)
-        if reference is None:
-            raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
-        self._raise_if_expired(reference, now, "reference")
+            reference = self._reference_caches.get(handle.reference_cache_id)
+            if reference is None:
+                raise CacheNotFoundError(f"reference cache not found: {handle.reference_cache_id}")
+            self._raise_if_expired(reference, now, "reference")
 
-        self._raise_condition_conflict(
-            "reference_cache_id",
-            handle.reference_cache_id,
-            expected_request.reference_cache_id,
-        )
-        self._raise_condition_conflict(
-            "model_fingerprint",
-            handle.model_fingerprint,
-            expected_request.model_fingerprint,
-        )
-        self._raise_condition_conflict(
-            "tokenizer_fingerprint",
-            handle.tokenizer_fingerprint,
-            expected_request.tokenizer_fingerprint,
-        )
-        self._raise_condition_conflict(
-            "condition_fingerprint",
-            handle.condition_fingerprint,
-            expected_request.condition_fingerprint,
-        )
-        self._raise_condition_conflict(
-            "sequence_length",
-            handle.sequence_length,
-            expected_request.bucket.sequence_length,
-            "bucket",
-        )
-        self._raise_condition_conflict(
-            "text_len",
-            handle.text_len,
-            expected_request.bucket.text_len,
-            "bucket",
-        )
-        self._raise_condition_conflict(
-            "speaker_context_len_bucket",
-            handle.speaker_context_len_bucket,
-            expected_request.bucket.speaker_context_len_bucket,
-            "bucket",
-        )
-        self._raise_condition_conflict(
-            "speaker_context_len",
-            handle.speaker_context_len,
-            expected_request.speaker_context_len,
-        )
-        self._raise_condition_conflict(
-            "branch_layouts",
-            handle.branch_layouts,
-            tuple(expected_request.branch_layouts),
-        )
-        self._raise_condition_conflict(
-            "state_layout",
-            handle.state_layout,
-            STATE_LAYOUT_PER_LAYER,
-        )
-        self._raise_condition_conflict(
-            "state_copies",
-            handle.state_copies,
-            int(expected_request.state_copies),
-        )
-        self._metrics["condition_hits"] += 1
-        self._record_hit(handle, now)
-        reference.last_used_at = now
-        return handle
+            self._raise_condition_conflict(
+                "reference_cache_id",
+                handle.reference_cache_id,
+                expected_request.reference_cache_id,
+            )
+            self._raise_condition_conflict(
+                "model_fingerprint",
+                handle.model_fingerprint,
+                expected_request.model_fingerprint,
+            )
+            self._raise_condition_conflict(
+                "tokenizer_fingerprint",
+                handle.tokenizer_fingerprint,
+                expected_request.tokenizer_fingerprint,
+            )
+            self._raise_condition_conflict(
+                "condition_fingerprint",
+                handle.condition_fingerprint,
+                expected_request.condition_fingerprint,
+            )
+            self._raise_condition_conflict(
+                "sequence_length",
+                handle.sequence_length,
+                expected_request.bucket.sequence_length,
+                "bucket",
+            )
+            self._raise_condition_conflict(
+                "text_len",
+                handle.text_len,
+                expected_request.bucket.text_len,
+                "bucket",
+            )
+            self._raise_condition_conflict(
+                "speaker_context_len_bucket",
+                handle.speaker_context_len_bucket,
+                expected_request.bucket.speaker_context_len_bucket,
+                "bucket",
+            )
+            self._raise_condition_conflict(
+                "speaker_context_len",
+                handle.speaker_context_len,
+                expected_request.speaker_context_len,
+            )
+            self._raise_condition_conflict(
+                "branch_layouts",
+                handle.branch_layouts,
+                tuple(expected_request.branch_layouts),
+            )
+            self._raise_condition_conflict(
+                "state_layout",
+                handle.state_layout,
+                STATE_LAYOUT_PER_LAYER,
+            )
+            self._raise_condition_conflict(
+                "state_copies",
+                handle.state_copies,
+                int(expected_request.state_copies),
+            )
+            self._metrics["condition_hits"] += 1
+            self._record_hit(handle, now)
+            reference.last_used_at = now
+            return handle
 
     def condition_cache_id_for_request(self, request: ConditionCacheRequest) -> str:
         self._validate_condition_request(request)
         return _condition_cache_id(request)
 
     def metrics_snapshot(self) -> dict[str, int]:
-        return {
-            **self._metrics,
-            "total_memory_bytes": self._compute_total_memory_bytes(),
-            "max_memory_bytes": -1
-            if self._max_memory_bytes is None
-            else int(self._max_memory_bytes),
-            "reference_count": len(self._reference_caches),
-            "condition_count": len(self._condition_caches),
-        }
+        with self._manager_lock:
+            return {
+                **self._metrics,
+                "total_memory_bytes": self._compute_total_memory_bytes(),
+                "max_memory_bytes": -1
+                if self._max_memory_bytes is None
+                else int(self._max_memory_bytes),
+                "reference_count": len(self._reference_caches),
+                "condition_count": len(self._condition_caches),
+            }
 
     def _compute_total_memory_bytes(self) -> int:
-        reference_total = sum(handle.memory_bytes for handle in self._reference_caches.values())
-        condition_total = sum(handle.memory_bytes for handle in self._condition_caches.values())
-        return int(reference_total + condition_total)
+        with self._manager_lock:
+            reference_total = sum(handle.memory_bytes for handle in self._reference_caches.values())
+            condition_total = sum(handle.memory_bytes for handle in self._condition_caches.values())
+            return int(reference_total + condition_total)
 
     def _evict_to_memory_budget(
         self,
@@ -1159,6 +1197,7 @@ class InMemoryCoreMLCacheManager:
         handle = self._reference_caches.pop(cache_id)
         self._metrics["evictions"] += 1
         self._metrics["evicted_bytes"] += int(handle.memory_bytes)
+        self._notify_reference_removed(cache_id)
 
     def _reference_has_dependents(self, reference_cache_id: str) -> bool:
         return any(
@@ -1167,36 +1206,58 @@ class InMemoryCoreMLCacheManager:
         )
 
     def prune_expired(self) -> dict[str, int]:
-        now = self._now()
-        expired_reference_ids = {
-            cache_id
-            for cache_id, handle in self._reference_caches.items()
-            if self._is_expired(handle, now)
-        }
-        expired_condition_ids = {
-            cache_id
-            for cache_id, handle in self._condition_caches.items()
-            if self._is_expired(handle, now) or handle.reference_cache_id in expired_reference_ids
-        }
-        expired_condition_handles = {
-            cache_id: self._condition_caches[cache_id] for cache_id in expired_condition_ids
-        }
+        with self._manager_lock:
+            now = self._now()
+            expired_reference_ids = {
+                cache_id
+                for cache_id, handle in self._reference_caches.items()
+                if self._is_expired(handle, now)
+            }
+            expired_condition_ids = {
+                cache_id
+                for cache_id, handle in self._condition_caches.items()
+                if self._is_expired(handle, now)
+                or handle.reference_cache_id in expired_reference_ids
+            }
+            expired_condition_handles = {
+                cache_id: self._condition_caches[cache_id] for cache_id in expired_condition_ids
+            }
 
-        for cache_id in expired_condition_ids:
-            del self._condition_caches[cache_id]
-        for handle in expired_condition_handles.values():
-            if handle.reference_cache_id not in expired_reference_ids:
-                self._prune_resident_bucket_if_unused(
-                    handle.reference_cache_id,
-                    handle.bucket_id,
-                )
-        for cache_id in expired_reference_ids:
-            del self._reference_caches[cache_id]
+            for cache_id in expired_condition_ids:
+                del self._condition_caches[cache_id]
+            for handle in expired_condition_handles.values():
+                if handle.reference_cache_id not in expired_reference_ids:
+                    self._prune_resident_bucket_if_unused(
+                        handle.reference_cache_id,
+                        handle.bucket_id,
+                    )
+            for cache_id in expired_reference_ids:
+                del self._reference_caches[cache_id]
+            for cache_id in expired_reference_ids:
+                self._notify_reference_removed(cache_id)
 
-        return {
-            "reference": len(expired_reference_ids),
-            "condition": len(expired_condition_ids),
-        }
+            return {
+                "reference": len(expired_reference_ids),
+                "condition": len(expired_condition_ids),
+            }
+
+    def _notify_reference_removed(self, cache_id: str) -> None:
+        callback = self._on_reference_removed
+        if callback is not None:
+            callback(cache_id)
+
+    def _reference_prepare_lock(self, cache_id: str) -> threading.RLock:
+        return self._prepare_lock_for_cache_id(self._reference_prepare_locks, cache_id)
+
+    def _condition_prepare_lock(self, cache_id: str) -> threading.RLock:
+        return self._prepare_lock_for_cache_id(self._condition_prepare_locks, cache_id)
+
+    def _prepare_lock_for_cache_id(
+        self,
+        registry: tuple[threading.RLock, ...],
+        cache_id: str,
+    ) -> threading.RLock:
+        return registry[_prepare_lock_stripe_index(cache_id, len(registry))]
 
     def _now(self) -> datetime:
         return _normalise_datetime(self._clock())

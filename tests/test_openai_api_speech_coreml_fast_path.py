@@ -36,6 +36,28 @@ class FakeRuntime:
         self.legacy_requests: list[Any] = []
         self.fast_requests: list[tuple[Any, Any]] = []
         self.fast_exception: Exception | None = None
+        self.codec = SimpleNamespace(
+            sample_rate=24_000,
+            model=SimpleNamespace(hop_length=512),
+        )
+        self.model_cfg = SimpleNamespace(
+            latent_patch_size=2,
+            text_tokenizer_repo="fake-tokenizer",
+            text_add_bos=True,
+        )
+        self.tokenizer_fingerprint = "tokenizer:fake"
+
+    def estimate_patched_steps(self, seconds: float) -> int:
+        target_samples = int(float(seconds) * int(self.codec.sample_rate))
+        latent_steps = (target_samples + int(self.codec.model.hop_length) - 1) // int(
+            self.codec.model.hop_length
+        )
+        return (latent_steps + int(self.model_cfg.latent_patch_size) - 1) // int(
+            self.model_cfg.latent_patch_size
+        )
+
+    def tokenize_for_bucket(self, normalized_text: str) -> tuple[int, str]:
+        return len(normalized_text.encode("utf-8")) + 1, "sha256:fake-token-ids"
 
     def synthesize(self, request: Any, log_fn: Any = None) -> SimpleNamespace:
         del log_fn
@@ -145,6 +167,7 @@ def create_matching_condition_cache(client: TestClient) -> dict[str, object]:
 def assert_pcm_success(response: Any) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "audio/L16"
+    assert response.headers["X-Irodori-Voice-Resolved"] == "server-default"
     assert response.content == b"\x00" * 16
 
 
@@ -164,6 +187,7 @@ def test_no_irodori_uses_legacy_synthesize_and_pytorch_header(
 
     assert_pcm_success(response)
     assert response.headers["X-Irodori-Denoiser-Backend"] == "pytorch"
+    assert response.headers["X-Irodori-Cache-Auto"] == "miss-fallback"
     assert "X-Irodori-Condition-Cache-Id" not in response.headers
     assert calls["get_runtime"] == 1
     assert len(runtime.legacy_requests) == 1

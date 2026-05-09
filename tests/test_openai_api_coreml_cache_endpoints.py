@@ -3,9 +3,12 @@ from __future__ import annotations
 import importlib.util
 import sys
 from collections.abc import Iterator
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import torch
 from fastapi.testclient import TestClient
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +70,80 @@ def assert_cache_error(response, status_code: int, error_type: str) -> None:
     assert isinstance(body["error"]["message"], str)
 
 
+class FakeResidentRuntime:
+    def __init__(self) -> None:
+        self.prepare_calls: list[str | None] = []
+        self.deleted: list[str] = []
+        self.store: dict[str, openai_api_server.ResidentReferenceTensors] = {}
+
+    def prepare_default_reference_tensors(
+        self,
+        ref_wav: str | Path,
+        max_ref_seconds: float | None,
+        *,
+        reference_cache_id: str | None = None,
+        reference_fingerprint: str | None = None,
+        force_refresh: bool = False,
+    ) -> openai_api_server.ResidentReferenceTensors:
+        del max_ref_seconds, force_refresh
+        cache_id = str(reference_cache_id or "resident_default")
+        self.prepare_calls.append(reference_cache_id)
+        ref_latent = torch.ones((1, 2, 2), dtype=torch.float32)
+        ref_mask = torch.ones((1, 2), dtype=torch.bool)
+        speaker_state = torch.ones((1, 3, 4), dtype=torch.float32)
+        speaker_mask = torch.ones((1, 3), dtype=torch.bool)
+        memory_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (ref_latent, ref_mask, speaker_state, speaker_mask)
+        )
+        now = datetime.now(timezone.utc)
+        resident = openai_api_server.ResidentReferenceTensors(
+            reference_cache_id=cache_id,
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            speaker_state=speaker_state,
+            speaker_mask=speaker_mask,
+            reference_fingerprint=reference_fingerprint,
+            source=str(ref_wav),
+            ref_len=2,
+            speaker_context_len=3,
+            speaker_dim=4,
+            memory_bytes=int(memory_bytes),
+            device="cpu",
+            dtype="torch.float32",
+            created_at=now,
+            last_used_at=now,
+        )
+        self.store[cache_id] = resident
+        return resident
+
+    def get_resident_reference_tensors(
+        self,
+        reference_cache_id: str,
+    ) -> openai_api_server.ResidentReferenceTensors | None:
+        return self.store.get(reference_cache_id)
+
+    def delete_resident_reference_tensors(self, reference_cache_id: str) -> bool:
+        self.deleted.append(reference_cache_id)
+        return self.store.pop(reference_cache_id, None) is not None
+
+    def coreml_stateful_metrics_snapshot(self) -> list[dict[str, object]]:
+        return []
+
+    def resident_reference_metrics_snapshot(self) -> dict[str, object]:
+        return {
+            "count": len(self.store),
+            "memory_bytes": sum(resident.memory_bytes for resident in self.store.values()),
+            "entries": [
+                {
+                    "reference_cache_id": resident.reference_cache_id,
+                    "memory_bytes": resident.memory_bytes,
+                }
+                for resident in self.store.values()
+            ],
+        }
+
+
 def create_reference_cache(client: TestClient) -> dict[str, object]:
     response = client.post(
         "/v1/tts/reference-caches",
@@ -92,6 +169,28 @@ def create_independent_condition_cache(
     )
     assert response.status_code == 201
     return response.json()
+
+
+def test_server_reference_fingerprint_changes_with_reference_wav_contents(
+    tmp_path: Path,
+    settings: ServerSettings,
+) -> None:
+    reference_wav = tmp_path / "rem.wav"
+    reference_wav.write_bytes(b"first reference bytes")
+    first_settings = replace(settings, reference_wav=reference_wav, max_ref_seconds=12.5)
+
+    first = openai_api_server._server_reference_fingerprint(first_settings)
+    reference_wav.write_bytes(b"second reference bytes")
+    second = openai_api_server._server_reference_fingerprint(first_settings)
+    third = openai_api_server._server_reference_fingerprint(
+        replace(first_settings, max_ref_seconds=5.0),
+    )
+
+    assert first.startswith(f"server_default:{reference_wav}:sha256:")
+    assert ":max_ref_seconds:12.5" in first
+    assert second.startswith(f"server_default:{reference_wav}:sha256:")
+    assert first != second
+    assert second != third
 
 
 def test_reference_cache_create_reuse_get_and_resident_buckets(
@@ -528,9 +627,133 @@ def test_cache_metrics_endpoint_does_not_load_runtime(client: TestClient) -> Non
     body = response.json()
     assert "cache_manager" in body
     assert body["coreml_stateful_backends"] == []
+    assert body["resident_references"] == {}
+    assert body["resident_speaker_kv"] == {}
     snapshot = body["cache_manager"]
     assert "reference_hits" in snapshot
     assert "evictions" in snapshot
+
+
+def test_cache_metrics_endpoint_exposes_resident_speaker_kv_from_loaded_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    speaker_kv_snapshot = {
+        "count": 1,
+        "memory_bytes": 4096,
+        "max_entries": 4,
+        "resident_speaker_kv_hits": 2,
+        "resident_speaker_kv_misses": 1,
+        "resident_speaker_kv_evictions": 0,
+        "resident_speaker_kv_deletes": 0,
+        "entries": [
+            {
+                "reference_cache_id": "ref_runtime",
+                "reference_fingerprint": "fp",
+                "sequence_length_bucket": 100,
+                "speaker_context_len_bucket": 160,
+                "branch_layout": "joint2",
+                "scale_signature": "joint2:s4.0",
+                "memory_bytes": 4096,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "last_used_at": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    }
+
+    class SpeakerKvRuntime:
+        def coreml_stateful_metrics_snapshot(self) -> list[dict[str, object]]:
+            return []
+
+        def resident_reference_metrics_snapshot(self) -> dict[str, object]:
+            return {"count": 0, "memory_bytes": 0, "entries": []}
+
+        def resident_speaker_kv_metrics_snapshot(self) -> dict[str, object]:
+            return speaker_kv_snapshot
+
+    runtime = SpeakerKvRuntime()
+
+    monkeypatch.setattr(
+        openai_api_server.RuntimeState,
+        "runtime_if_loaded",
+        property(lambda self: runtime),
+    )
+
+    def fail_get_runtime(self: openai_api_server.RuntimeState) -> None:
+        raise AssertionError("cache-metrics must not load the synthesis runtime")
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", fail_get_runtime)
+    with TestClient(create_app(settings)) as test_client:
+        response = test_client.get("/v1/tts/cache-metrics")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["resident_speaker_kv"] == speaker_kv_snapshot
+        for entry in body["resident_speaker_kv"]["entries"]:
+            assert "speaker_kv" not in entry
+            assert "tensors" not in entry
+            assert "tensor" not in entry
+
+
+def test_lifespan_prepares_default_reference_resident_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    runtime = FakeResidentRuntime()
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeResidentRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+    with TestClient(create_app(replace(settings, preload=True))) as test_client:
+        resident_ids = [cache_id for cache_id in runtime.store if cache_id.startswith("ref_")]
+        assert len(resident_ids) == 1
+        reference_id = resident_ids[0]
+
+        response = test_client.get(f"/v1/tts/reference-caches/{reference_id}")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == reference_id
+        assert body["memory_bytes"] == runtime.store[reference_id].memory_bytes
+        assert body["memory_bytes_estimated"] is False
+        assert body["shapes"] == {
+            "ref_len": 2,
+            "speaker_context_len": 3,
+            "speaker_dim": 4,
+        }
+        assert body["resident_layers"] == [
+            "ref_latent",
+            "ref_mask",
+            "speaker_state",
+            "speaker_mask",
+        ]
+
+        metrics = test_client.get("/v1/tts/cache-metrics").json()
+        assert metrics["resident_references"]["count"] == 1
+        assert "ref_latent" not in metrics["resident_references"]["entries"][0]
+
+
+def test_delete_reference_cache_prunes_loaded_runtime_resident_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    runtime = FakeResidentRuntime()
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeResidentRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+    with TestClient(create_app(replace(settings, preload=True))) as test_client:
+        reference_id = next(cache_id for cache_id in runtime.store if cache_id.startswith("ref_"))
+
+        response = test_client.delete(f"/v1/tts/reference-caches/{reference_id}")
+
+        assert response.status_code == 204
+        assert reference_id in runtime.deleted
+        assert reference_id not in runtime.store
 
 
 def test_condition_cache_rejects_bare_joint_with_unequal_default_scales(
@@ -650,3 +873,73 @@ def test_condition_cache_delete_then_get_returns_not_found(client: TestClient) -
     reference_response = client.get(f"/v1/tts/reference-caches/{reference['id']}")
     assert reference_response.status_code == 200
     assert reference_response.json()["resident_buckets"] == []
+
+
+class _PrecompileFailingRuntime(FakeResidentRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.precompile_calls: list[list[openai_api_server.CoreMLConditionBucket]] = []
+
+    def precompile_coreml_stateful_buckets(
+        self,
+        buckets: list[openai_api_server.CoreMLConditionBucket],
+    ) -> None:
+        self.precompile_calls.append(list(buckets))
+        raise openai_api_server.CoreMLStatefulUnavailableError("coremltools not installed")
+
+
+def _warmup_settings(settings: ServerSettings, *, strict: bool) -> ServerSettings:
+    bucket = openai_api_server.CoreMLConditionBucket(
+        sequence_length=100,
+        text_len=256,
+        speaker_context_len_bucket=160,
+    )
+    return replace(
+        settings,
+        preload=True,
+        warmup_buckets=(bucket,),
+        strict_coreml=strict,
+    )
+
+
+def test_lifespan_warmup_continues_when_coreml_unavailable_and_not_strict(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _PrecompileFailingRuntime()
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> _PrecompileFailingRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    with TestClient(create_app(_warmup_settings(settings, strict=False))) as test_client:
+        response = test_client.get("/v1/health")
+        assert response.status_code == 200
+
+    assert len(runtime.precompile_calls) == 1
+    captured = capsys.readouterr()
+    assert "CoreML stateful warmup unavailable" in captured.out
+
+
+def test_lifespan_warmup_strict_reraises_when_coreml_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    runtime = _PrecompileFailingRuntime()
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> _PrecompileFailingRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    with pytest.raises(openai_api_server.CoreMLStatefulUnavailableError):
+        with TestClient(create_app(_warmup_settings(settings, strict=True))):
+            pass
+
+    assert len(runtime.precompile_calls) == 1

@@ -6,6 +6,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
+    "coremltools>=8.0,<10; sys_platform == 'darwin'",
     "dacvae",
     "datasets>=3.0.0",
     "gradio>=5.0.0",

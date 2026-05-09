@@ -19,6 +19,13 @@
     <string>mps</string>
     <string>--codec-device</string>
     <string>mps</string>
+    <string>--preload</string>
+    <string>--warmup-bucket</string>
+    <string>S=100,T=256,R=160</string>
+    <string>--warmup-bucket</string>
+    <string>S=160,T=256,R=160</string>
+    <string>--warmup-bucket</string>
+    <string>S=200,T=256,R=160</string>
   </array>
 
   <key>WorkingDirectory</key>

@@ -231,6 +231,40 @@ class JointAttention(nn.Module):
         x_rot = apply_rotary_emb(x_rot, freqs_cis)
         return torch.cat([x_rot, x_passthrough], dim=-2)
 
+    def project_text_context_kv(
+        self,
+        text_context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project only the text branch of conditioning KV (no speaker/caption work)."""
+        bsz = text_context.shape[0]
+        k_text = self.wk_text(text_context).reshape(
+            bsz, text_context.shape[1], self.heads, self.head_dim
+        )
+        v_text = self.wv_text(text_context).reshape(
+            bsz, text_context.shape[1], self.heads, self.head_dim
+        )
+        k_text = self.k_norm(k_text)
+        return k_text, v_text
+
+    def project_speaker_context_kv(
+        self,
+        speaker_context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project only the speaker branch of conditioning KV (no text/caption work)."""
+        if not self.has_speaker_condition:
+            raise ValueError(
+                "project_speaker_context_kv requires speaker conditioning to be enabled."
+            )
+        bsz = speaker_context.shape[0]
+        k_speaker = self.wk_speaker(speaker_context).reshape(
+            bsz, speaker_context.shape[1], self.heads, self.head_dim
+        )
+        v_speaker = self.wv_speaker(speaker_context).reshape(
+            bsz, speaker_context.shape[1], self.heads, self.head_dim
+        )
+        k_speaker = self.k_norm(k_speaker)
+        return k_speaker, v_speaker
+
     def project_context_kv(
         self,
         text_context: torch.Tensor,
@@ -829,6 +863,26 @@ class TextToLatentRFDiT(nn.Module):
                 speaker_context=speaker_state,
                 caption_context=caption_state,
             )
+            for block in self.blocks
+        ]
+
+    def build_text_context_kv_cache(
+        self,
+        text_state: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Project per-layer text conditioning KV without touching speaker/caption."""
+        return [
+            block.attention.project_text_context_kv(text_context=text_state)
+            for block in self.blocks
+        ]
+
+    def build_speaker_context_kv_cache(
+        self,
+        speaker_state: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Project per-layer speaker conditioning KV without touching text/caption."""
+        return [
+            block.attention.project_speaker_context_kv(speaker_context=speaker_state)
             for block in self.blocks
         ]
 

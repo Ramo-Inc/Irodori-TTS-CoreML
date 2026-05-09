@@ -1,3 +1,4 @@
+coremltools>=8.0,<10; sys_platform == 'darwin'
 dacvae @ git+https://github.com/facebookresearch/dacvae
 datasets>=3.0.0
 gradio>=5.0.0

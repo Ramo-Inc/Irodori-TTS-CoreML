@@ -6,9 +6,10 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import threading
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from irodori_tts.coreml_cache import (
     CACHE_MODE_REFRESH,
     CACHE_MODE_REQUIRE,
     CacheConflictError,
+    CacheCreateResult,
     CacheExpiredError,
     CacheNotFoundError,
     CacheValidationError,
@@ -45,6 +47,7 @@ from irodori_tts.coreml_cache import (
 )
 from irodori_tts.coreml_stateful import CoreMLStatefulUnavailableError
 from irodori_tts.inference_runtime import (
+    ResidentReferenceTensors,
     RuntimeKey,
     SamplingRequest,
     clear_cached_runtime,
@@ -52,6 +55,7 @@ from irodori_tts.inference_runtime import (
     get_cached_runtime,
     list_available_runtime_devices,
 )
+from irodori_tts.text_normalization import normalize_text
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CHECKPOINT = "Aratako/Irodori-TTS-500M-v2"
@@ -79,6 +83,9 @@ CONDITION_CFG_WINDOW_DEFAULTS = {
     "min_t": 0.5,
     "max_t": 1.0,
 }
+AUTO_SEQUENCE_LENGTH_BUCKETS = (100, 160, 200)
+AUTO_TEXT_LEN_BUCKETS = (64, 128, 256)
+AUTO_SPEAKER_CONTEXT_LEN_BUCKET = 160
 _MISSING = object()
 
 
@@ -106,6 +113,16 @@ class ServerSettings:
     log_timings: bool
     cache_max_memory_bytes: int | None = None
     warmup_buckets: tuple[CoreMLConditionBucket, ...] = ()
+    auto_prepare_default_cache: bool = True
+    strict_coreml: bool = False
+    default_reference_cache_prepare: bool = True
+    default_condition_cache_prepare_text: str | None = None
+    condition_cache_default_ttl_seconds: float | None = 86400.0
+    max_resident_speaker_kv_buckets: int = 3
+    max_resident_condition_cache_entries: int = 0
+    enable_resident_reference_cache: bool = True
+    enable_resident_speaker_kv: bool = True
+    enable_condition_packed_kv_cache: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,6 +136,28 @@ class SpeechSegmentPlan:
     segments: tuple[SpeechSegment, ...]
     total_seconds: float
     seconds_mode: str
+
+
+@dataclass(frozen=True)
+class AutoSpeechPlanningContext:
+    segment_text: str
+    normalized_text: str
+    seconds: float
+    sample_rate: int
+    hop_length: int
+    latent_patch_size: int
+    tokenizer_fingerprint: str
+    token_len: int
+    token_ids_hash: str
+    patched_steps: int
+
+
+@dataclass(frozen=True)
+class AutoBucketResolution:
+    bucket: CoreMLConditionBucket | None
+    reason: str | None
+    attempted: str | None
+    planning: AutoSpeechPlanningContext | None = None
 
 
 class RuntimeState:
@@ -149,8 +188,19 @@ class RuntimeState:
     def get_runtime(self):
         runtime, _ = get_cached_runtime(self.runtime_key())
         with self._lock:
+            newly_cached = self._runtime is not runtime
             self._runtime = runtime
+        if newly_cached:
+            self._apply_runtime_settings(runtime)
         return runtime
+
+    def _apply_runtime_settings(self, runtime: Any) -> None:
+        configure = getattr(runtime, "configure_resident_speaker_kv", None)
+        if callable(configure):
+            configure(
+                enabled=self.settings.enable_resident_speaker_kv,
+                max_entries=self.settings.max_resident_speaker_kv_buckets,
+            )
 
     @property
     def runtime_if_loaded(self) -> Any | None:
@@ -676,6 +726,46 @@ def _condition_fingerprint(
     return canonical
 
 
+def _internal_auto_condition_fingerprint(
+    *,
+    normalized_text: str,
+    token_ids_hash: str,
+    tokenizer_fingerprint: str,
+    model_fingerprint: str,
+    reference_fingerprint: str,
+    caption: str | None,
+    bucket: CoreMLConditionBucket,
+    cfg: dict[str, Any],
+    branch_layouts: tuple[str, ...] | list[str],
+    speaker_context_len: int,
+    state_copies: int,
+) -> str:
+    fingerprint_payload = {
+        "kind": "condition_auto_v2",
+        "normalized_text": normalized_text,
+        "token_ids_hash": token_ids_hash,
+        "tokenizer_fingerprint": tokenizer_fingerprint,
+        "model_fingerprint": model_fingerprint,
+        "reference_fingerprint": reference_fingerprint,
+        "caption": caption,
+        "bucket": {
+            "sequence_length": int(bucket.sequence_length),
+            "text_len": int(bucket.text_len),
+            "speaker_context_len": int(bucket.speaker_context_len_bucket),
+        },
+        "speaker_context_len": int(speaker_context_len),
+        "branch_layouts": list(branch_layouts),
+        "state_copies": int(state_copies),
+        "cfg": cfg,
+    }
+    encoded = json.dumps(
+        fingerprint_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"condition:auto-v2:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _condition_cache_request(
     payload: dict[str, Any],
     settings: ServerSettings,
@@ -740,8 +830,8 @@ def _speech_irodori_extension(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 def _speech_cache_mode(irodori: dict[str, Any] | None) -> str:
     if irodori is None:
-        return CACHE_MODE_OFF
-    return normalize_speech_cache_mode(irodori.get("cache_mode"))
+        return CACHE_MODE_AUTO
+    return normalize_speech_cache_mode(irodori.get("cache_mode"), default=CACHE_MODE_AUTO)
 
 
 def _speech_cache_id(irodori: dict[str, Any] | None) -> str | None:
@@ -755,10 +845,288 @@ def _speech_cache_id(irodori: dict[str, Any] | None) -> str | None:
     return value.strip()
 
 
+def _bucket_header_value(bucket: CoreMLConditionBucket) -> str:
+    return (
+        f"S{int(bucket.sequence_length)}_T{int(bucket.text_len)}_"
+        f"R{int(bucket.speaker_context_len_bucket)}"
+    )
+
+
+def _auto_bucket_attempted(
+    sequence_length: int | None,
+    text_len: int | None,
+) -> str:
+    s_value = str(sequence_length) if sequence_length is not None else ">200"
+    t_value = str(text_len) if text_len is not None else ">256"
+    return f"S{s_value}_T{t_value}_R{AUTO_SPEAKER_CONTEXT_LEN_BUCKET}"
+
+
+def _smallest_sufficient_bucket(value: int, buckets: tuple[int, ...]) -> int | None:
+    for bucket in buckets:
+        if int(value) <= int(bucket):
+            return int(bucket)
+    return None
+
+
+def _auto_select_bucket(planning: AutoSpeechPlanningContext) -> AutoBucketResolution:
+    sequence_length = _smallest_sufficient_bucket(
+        int(planning.patched_steps),
+        AUTO_SEQUENCE_LENGTH_BUCKETS,
+    )
+    text_len = _smallest_sufficient_bucket(
+        int(planning.token_len),
+        AUTO_TEXT_LEN_BUCKETS,
+    )
+    if sequence_length is None:
+        return AutoBucketResolution(
+            bucket=None,
+            reason="oversize_s",
+            attempted=_auto_bucket_attempted(sequence_length, text_len),
+            planning=planning,
+        )
+    if text_len is None:
+        return AutoBucketResolution(
+            bucket=None,
+            reason="oversize_t",
+            attempted=_auto_bucket_attempted(sequence_length, text_len),
+            planning=planning,
+        )
+    return AutoBucketResolution(
+        bucket=CoreMLConditionBucket(
+            sequence_length=sequence_length,
+            text_len=text_len,
+            speaker_context_len_bucket=AUTO_SPEAKER_CONTEXT_LEN_BUCKET,
+        ),
+        reason=None,
+        attempted=None,
+        planning=planning,
+    )
+
+
+def _runtime_tokenizer_fingerprint(runtime: Any) -> str:
+    explicit = getattr(runtime, "tokenizer_fingerprint", None)
+    if callable(explicit):
+        return str(explicit())
+    if explicit is not None:
+        return str(explicit)
+
+    model_cfg = getattr(runtime, "model_cfg", None)
+    tokenizer = getattr(runtime, "tokenizer", None)
+    payload = {
+        "repo": getattr(model_cfg, "text_tokenizer_repo", "unknown"),
+        "add_bos": getattr(model_cfg, "text_add_bos", None),
+        "vocab_size": getattr(tokenizer, "vocab_size", None),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"tokenizer:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _build_auto_speech_planning_context(
+    segment: SpeechSegment,
+    runtime: Any,
+) -> AutoSpeechPlanningContext:
+    normalized_text = normalize_text(segment.text).strip()
+    if normalized_text == "":
+        raise ValueError("text became empty after normalization.")
+
+    token_len, token_ids_hash = runtime.tokenize_for_bucket(normalized_text)
+    return AutoSpeechPlanningContext(
+        segment_text=segment.text,
+        normalized_text=normalized_text,
+        seconds=float(segment.seconds),
+        sample_rate=int(runtime.codec.sample_rate),
+        hop_length=int(runtime.codec.model.hop_length),
+        latent_patch_size=int(runtime.model_cfg.latent_patch_size),
+        tokenizer_fingerprint=_runtime_tokenizer_fingerprint(runtime),
+        token_len=int(token_len),
+        token_ids_hash=str(token_ids_hash),
+        patched_steps=int(runtime.estimate_patched_steps(float(segment.seconds))),
+    )
+
+
+def _resolve_auto_bucket_resolution(
+    irodori: dict[str, Any] | None,
+    segment: SpeechSegment,
+    runtime: Any,
+) -> AutoBucketResolution:
+    if irodori is not None and "bucket" in irodori:
+        return AutoBucketResolution(
+            bucket=_condition_cache_bucket(irodori),
+            reason=None,
+            attempted=None,
+        )
+    return _auto_select_bucket(_build_auto_speech_planning_context(segment, runtime))
+
+
+def _resolve_auto_bucket_resolutions(
+    irodori: dict[str, Any] | None,
+    segments: tuple[SpeechSegment, ...],
+    runtime: Any,
+) -> list[AutoBucketResolution]:
+    return [_resolve_auto_bucket_resolution(irodori, segment, runtime) for segment in segments]
+
+
 def _speech_reference_cache_request(settings: ServerSettings) -> ReferenceCacheRequest:
     return _reference_cache_request(
         {"source": {"type": "server_default"}},
         settings,
+    )
+
+
+def _server_reference_fingerprint(settings: ServerSettings) -> str:
+    digest = hashlib.sha256()
+    with settings.reference_wav.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    max_ref_seconds = (
+        "none" if settings.max_ref_seconds is None else f"{float(settings.max_ref_seconds):.6g}"
+    )
+    return (
+        f"server_default:{settings.reference_wav}:"
+        f"sha256:{digest.hexdigest()}:max_ref_seconds:{max_ref_seconds}"
+    )
+
+
+def _resident_reference_prepare_key(settings: ServerSettings) -> str:
+    encoded = _server_reference_fingerprint(settings).encode("utf-8")
+    return f"resident_default_{hashlib.sha256(encoded).hexdigest()[:32]}"
+
+
+def _resident_reference_cache_request(
+    settings: ServerSettings,
+    resident: ResidentReferenceTensors,
+) -> ReferenceCacheRequest:
+    return ReferenceCacheRequest(
+        model_fingerprint=f"model:{settings.checkpoint}",
+        codec_fingerprint=f"codec:{settings.codec_repo}",
+        reference_fingerprint=resident.reference_fingerprint
+        or _server_reference_fingerprint(settings),
+        speaker_context_len=int(resident.speaker_context_len),
+        memory_bytes=int(resident.memory_bytes),
+        ttl_seconds=None,
+        metadata={
+            "source": {"type": "server_default", "path": str(settings.reference_wav)},
+            "resident": True,
+            "device": resident.device,
+            "dtype": resident.dtype,
+        },
+        model=settings.api_model_id,
+        ref_len=int(resident.ref_len),
+        speaker_dim=int(resident.speaker_dim),
+        memory_bytes_estimated=False,
+        resident_layers=("ref_latent", "ref_mask", "speaker_state", "speaker_mask"),
+    )
+
+
+@dataclass(frozen=True)
+class _ResidentReferencePlan:
+    provisional_id: str
+    resident: ResidentReferenceTensors
+    request: ReferenceCacheRequest
+
+
+def _prepare_runtime_default_reference_plan(
+    runtime: Any,
+    settings: ServerSettings,
+    *,
+    force_refresh: bool = False,
+) -> _ResidentReferencePlan:
+    prepare = getattr(runtime, "prepare_default_reference_tensors", None)
+    if not callable(prepare):
+        raise RuntimeError("runtime does not expose prepare_default_reference_tensors")
+
+    reference_fingerprint = _server_reference_fingerprint(settings)
+    provisional_id = _resident_reference_prepare_key(settings)
+    resident = prepare(
+        settings.reference_wav,
+        settings.max_ref_seconds,
+        reference_cache_id=provisional_id,
+        reference_fingerprint=reference_fingerprint,
+        force_refresh=force_refresh,
+    )
+    request = _resident_reference_cache_request(settings, resident)
+    return _ResidentReferencePlan(
+        provisional_id=provisional_id,
+        resident=resident,
+        request=request,
+    )
+
+
+def _delete_runtime_resident_reference(runtime: Any, reference_cache_id: str) -> None:
+    delete_resident = getattr(runtime, "delete_resident_reference_tensors", None)
+    if callable(delete_resident):
+        delete_resident(reference_cache_id)
+
+
+def _materialize_runtime_default_reference_resident(
+    runtime: Any,
+    settings: ServerSettings,
+    cache_manager: InMemoryCoreMLCacheManager,
+    plan: _ResidentReferencePlan,
+    cache_mode: str = CACHE_MODE_CREATE_OR_REUSE,
+    force_refresh: bool = False,
+) -> CacheCreateResult:
+    final_id = cache_manager.reference_cache_id_for_request(plan.request)
+    final_resident_prepared = False
+    try:
+        prepare = getattr(runtime, "prepare_default_reference_tensors", None)
+        if not callable(prepare):
+            raise RuntimeError("runtime does not expose prepare_default_reference_tensors")
+        final_resident = prepare(
+            settings.reference_wav,
+            settings.max_ref_seconds,
+            reference_cache_id=final_id,
+            reference_fingerprint=plan.resident.reference_fingerprint
+            or _server_reference_fingerprint(settings),
+            force_refresh=force_refresh,
+        )
+        final_resident_prepared = True
+        final_request = _resident_reference_cache_request(settings, final_resident)
+        final_request_id = cache_manager.reference_cache_id_for_request(final_request)
+        if final_request_id != final_id:
+            _delete_runtime_resident_reference(runtime, final_id)
+            final_resident_prepared = False
+            raise CacheConflictError(
+                "resident reference metadata changed during materialization",
+            )
+        commit_mode = cache_mode
+        if cache_mode == CACHE_MODE_CREATE_OR_REUSE:
+            try:
+                existing_handle = cache_manager.peek_reference_cache(final_id)
+            except (CacheExpiredError, CacheNotFoundError):
+                pass
+            else:
+                if not _is_resident_reference_handle(existing_handle):
+                    commit_mode = CACHE_MANAGER_REFRESH_MODE
+        return cache_manager.prepare_reference_cache(final_request, cache_mode=commit_mode)
+    except Exception:
+        if final_resident_prepared:
+            _delete_runtime_resident_reference(runtime, final_id)
+        raise
+    finally:
+        if plan.provisional_id != final_id:
+            _delete_runtime_resident_reference(runtime, plan.provisional_id)
+
+
+def _prepare_runtime_default_reference_resident(
+    runtime: Any,
+    settings: ServerSettings,
+    cache_manager: InMemoryCoreMLCacheManager,
+    cache_mode: str = CACHE_MODE_CREATE_OR_REUSE,
+) -> CacheCreateResult:
+    force_refresh = cache_mode == CACHE_MANAGER_REFRESH_MODE
+    plan = _prepare_runtime_default_reference_plan(
+        runtime,
+        settings,
+        force_refresh=force_refresh,
+    )
+    return _materialize_runtime_default_reference_resident(
+        runtime,
+        settings,
+        cache_manager,
+        plan,
+        cache_mode=cache_mode,
+        force_refresh=force_refresh,
     )
 
 
@@ -774,6 +1142,8 @@ def _raise_speech_reference_conflict(
 def _validate_speech_reference_cache(
     reference_handle: Any,
     expected_request: ReferenceCacheRequest,
+    *,
+    validate_speaker_context_len: bool = True,
 ) -> None:
     _raise_speech_reference_conflict(
         "model_fingerprint",
@@ -790,10 +1160,32 @@ def _validate_speech_reference_cache(
         reference_handle.reference_fingerprint,
         expected_request.reference_fingerprint,
     )
-    _raise_speech_reference_conflict(
-        "speaker_context_len",
-        reference_handle.speaker_context_len,
-        expected_request.speaker_context_len,
+    if validate_speaker_context_len:
+        _raise_speech_reference_conflict(
+            "speaker_context_len",
+            reference_handle.speaker_context_len,
+            expected_request.speaker_context_len,
+        )
+
+
+def _is_resident_reference_handle(reference_handle: Any) -> bool:
+    metadata = getattr(reference_handle, "metadata", {}) or {}
+    return not bool(getattr(reference_handle, "memory_bytes_estimated", True)) and bool(
+        metadata.get("resident")
+    )
+
+
+def _expected_speech_reference_cache_request_for_handle(
+    reference_handle: Any,
+    settings: ServerSettings,
+) -> ReferenceCacheRequest:
+    if not _is_resident_reference_handle(reference_handle):
+        return _speech_reference_cache_request(settings)
+    return ReferenceCacheRequest(
+        model_fingerprint=f"model:{settings.checkpoint}",
+        codec_fingerprint=f"codec:{settings.codec_repo}",
+        reference_fingerprint=_server_reference_fingerprint(settings),
+        speaker_context_len=int(reference_handle.speaker_context_len),
     )
 
 
@@ -875,6 +1267,17 @@ class _SpeechCacheResolution:
     reference_cache_id: str | None
     reference_created: bool
     condition_created: bool
+    bucket: CoreMLConditionBucket | None = None
+    auto_status: str | None = None
+    fallback_reason: str | None = None
+
+
+def _condition_bucket_from_handle(handle: ConditionCacheHandle) -> CoreMLConditionBucket:
+    return CoreMLConditionBucket(
+        sequence_length=int(handle.sequence_length),
+        text_len=int(handle.text_len),
+        speaker_context_len_bucket=int(handle.speaker_context_len_bucket),
+    )
 
 
 def _resolve_speech_cache(
@@ -885,29 +1288,48 @@ def _resolve_speech_cache(
     caption: str | None,
     settings: ServerSettings,
     cache_manager: InMemoryCoreMLCacheManager,
-) -> _SpeechCacheResolution:
+    *,
+    runtime: Any | None = None,
+    resident_reference_plan: _ResidentReferencePlan | None = None,
+) -> list[_SpeechCacheResolution]:
     if cache_mode == CACHE_MODE_OFF:
-        return _SpeechCacheResolution(None, None, False, False)
+        return [
+            _SpeechCacheResolution(None, None, False, False, auto_status="off")
+            for _segment in segment_plan.segments
+        ]
 
     if cache_mode in {CACHE_MODE_PREPARE, CACHE_MODE_REFRESH}:
         if len(segment_plan.segments) != 1:
             raise CacheConflictError(
                 "cache_mode=prepare/refresh does not support multi-segment speech",
             )
-        return _prepare_or_refresh_speech_cache(
-            irodori=irodori,
-            cache_mode=cache_mode,
-            cache_id=cache_id,
-            segment=segment_plan.segments[0],
-            caption=caption,
-            settings=settings,
-            cache_manager=cache_manager,
-        )
+        return [
+            _prepare_or_refresh_speech_cache(
+                irodori=irodori,
+                cache_mode=cache_mode,
+                cache_id=cache_id,
+                segment=segment_plan.segments[0],
+                caption=caption,
+                settings=settings,
+                cache_manager=cache_manager,
+                runtime=runtime,
+                resident_reference_plan=resident_reference_plan,
+            )
+        ]
 
     if cache_mode == CACHE_MODE_REQUIRE and cache_id is None:
         raise CacheValidationError("irodori.cache_id is required when cache_mode=require")
     if cache_id is None:
-        return _SpeechCacheResolution(None, None, False, False)
+        return [
+            _SpeechCacheResolution(
+                None,
+                None,
+                False,
+                False,
+                auto_status="miss-fallback",
+            )
+            for _segment in segment_plan.segments
+        ]
     if len(segment_plan.segments) != 1:
         raise CacheConflictError("single cache_id cannot be used with multi-segment speech")
 
@@ -915,37 +1337,60 @@ def _resolve_speech_cache(
         condition_handle = cache_manager.peek_condition_cache(cache_id)
     except (CacheExpiredError, CacheNotFoundError):
         if cache_mode == CACHE_MODE_AUTO:
-            return _SpeechCacheResolution(None, None, False, False)
+            return [
+                _SpeechCacheResolution(
+                    None,
+                    None,
+                    False,
+                    False,
+                    auto_status="miss-fallback",
+                )
+            ]
         raise
 
     try:
-        expected_reference_request = _speech_reference_cache_request(settings)
-        expected_reference_cache_id = cache_manager.reference_cache_id_for_request(
-            expected_reference_request,
-        )
         reference_handle = cache_manager.peek_reference_cache(
             condition_handle.reference_cache_id,
         )
-        _validate_speech_reference_cache(reference_handle, expected_reference_request)
+        expected_reference_request = _expected_speech_reference_cache_request_for_handle(
+            reference_handle,
+            settings,
+        )
+        _validate_speech_reference_cache(
+            reference_handle,
+            expected_reference_request,
+        )
         expected_request = _speech_condition_cache_request(
             irodori or {},
             settings,
-            expected_reference_cache_id,
-            expected_reference_request.speaker_context_len,
+            reference_handle.id,
+            reference_handle.speaker_context_len,
             segment_plan.segments[0],
             caption,
         )
         validated = cache_manager.require_condition_cache(cache_id, expected_request)
     except (CacheExpiredError, CacheNotFoundError):
         if cache_mode == CACHE_MODE_AUTO:
-            return _SpeechCacheResolution(None, None, False, False)
+            return [
+                _SpeechCacheResolution(
+                    None,
+                    None,
+                    False,
+                    False,
+                    auto_status="miss-fallback",
+                )
+            ]
         raise
-    return _SpeechCacheResolution(
-        condition_handle=validated,
-        reference_cache_id=validated.reference_cache_id,
-        reference_created=False,
-        condition_created=False,
-    )
+    return [
+        _SpeechCacheResolution(
+            condition_handle=validated,
+            reference_cache_id=validated.reference_cache_id,
+            reference_created=False,
+            condition_created=False,
+            bucket=_condition_bucket_from_handle(validated),
+            auto_status="hit",
+        )
+    ]
 
 
 def _prepare_or_refresh_speech_cache(
@@ -957,11 +1402,15 @@ def _prepare_or_refresh_speech_cache(
     caption: str | None,
     settings: ServerSettings,
     cache_manager: InMemoryCoreMLCacheManager,
+    runtime: Any | None = None,
+    resident_reference_plan: _ResidentReferencePlan | None = None,
 ) -> _SpeechCacheResolution:
-    reference_request = _speech_reference_cache_request(settings)
-    expected_reference_cache_id = cache_manager.reference_cache_id_for_request(
-        reference_request,
+    reference_request = (
+        resident_reference_plan.request
+        if resident_reference_plan is not None
+        else _speech_reference_cache_request(settings)
     )
+    expected_reference_cache_id = cache_manager.reference_cache_id_for_request(reference_request)
     condition_request = _speech_condition_cache_request(
         irodori or {},
         settings,
@@ -974,6 +1423,8 @@ def _prepare_or_refresh_speech_cache(
         condition_request,
     )
     if cache_id is not None and cache_id != expected_condition_cache_id:
+        if runtime is not None and resident_reference_plan is not None:
+            _delete_runtime_resident_reference(runtime, resident_reference_plan.provisional_id)
         raise CacheConflictError(
             "cache_id does not match prepared condition cache for this request",
         )
@@ -983,20 +1434,294 @@ def _prepare_or_refresh_speech_cache(
         if cache_mode == CACHE_MODE_REFRESH
         else CACHE_MODE_CREATE_OR_REUSE
     )
-    reference_result = cache_manager.prepare_reference_cache(
-        reference_request,
-        cache_mode=reference_cache_mode,
-    )
-    condition_result = cache_manager.prepare_condition_cache(
-        condition_request,
-        cache_mode=reference_cache_mode,
-    )
+    force_resident_refresh = reference_cache_mode == CACHE_MANAGER_REFRESH_MODE
+    if resident_reference_plan is not None:
+        if runtime is None:
+            raise RuntimeError("runtime is required to materialize resident reference metadata")
+        reference_result = _materialize_runtime_default_reference_resident(
+            runtime,
+            settings,
+            cache_manager,
+            resident_reference_plan,
+            cache_mode=reference_cache_mode,
+            force_refresh=force_resident_refresh,
+        )
+    else:
+        reference_result = cache_manager.prepare_reference_cache(
+            reference_request,
+            cache_mode=reference_cache_mode,
+        )
+    try:
+        condition_result = cache_manager.prepare_condition_cache(
+            condition_request,
+            cache_mode=reference_cache_mode,
+        )
+    except CACHE_EXCEPTIONS:
+        if not reference_result.reused:
+            cache_manager.delete_reference_cache(reference_result.handle.id, cascade=True)
+        raise
     return _SpeechCacheResolution(
         condition_handle=condition_result.handle,
         reference_cache_id=reference_result.handle.id,
         reference_created=not reference_result.reused,
         condition_created=not condition_result.reused,
+        bucket=_condition_bucket_from_handle(condition_result.handle),
+        auto_status="reused" if condition_result.reused else "prepared",
     )
+
+
+def _auto_planning_for_segment(
+    bucket_resolution: AutoBucketResolution,
+    segment: SpeechSegment,
+    runtime: Any,
+) -> AutoSpeechPlanningContext:
+    if bucket_resolution.planning is not None:
+        return bucket_resolution.planning
+    return _build_auto_speech_planning_context(segment, runtime)
+
+
+def _auto_internal_condition_cache_request(
+    *,
+    irodori: dict[str, Any] | None,
+    settings: ServerSettings,
+    runtime: Any,
+    reference_handle: Any,
+    bucket: CoreMLConditionBucket,
+    planning: AutoSpeechPlanningContext,
+    caption: str | None,
+) -> ConditionCacheRequest:
+    condition_payload: dict[str, Any] = dict(irodori or {})
+    if "cfg" not in condition_payload:
+        condition_payload["cfg"] = {"mode": "independent"}
+    cfg = _condition_cfg(condition_payload)
+    branch_layouts = _canonical_condition_branch_layouts(cfg)
+    state_copies = _state_copies_for_cfg(cfg)
+    tokenizer_fingerprint = _runtime_tokenizer_fingerprint(runtime)
+    model_fingerprint = f"model:{settings.checkpoint}"
+    reference_fingerprint = _server_reference_fingerprint(settings)
+    speaker_context_len = int(reference_handle.speaker_context_len)
+
+    condition_fingerprint = _internal_auto_condition_fingerprint(
+        normalized_text=planning.normalized_text,
+        token_ids_hash=planning.token_ids_hash,
+        tokenizer_fingerprint=tokenizer_fingerprint,
+        model_fingerprint=model_fingerprint,
+        reference_fingerprint=reference_fingerprint,
+        caption=caption,
+        bucket=bucket,
+        cfg=cfg,
+        branch_layouts=branch_layouts,
+        speaker_context_len=speaker_context_len,
+        state_copies=state_copies,
+    )
+    return ConditionCacheRequest(
+        reference_cache_id=reference_handle.id,
+        model_fingerprint=model_fingerprint,
+        tokenizer_fingerprint=tokenizer_fingerprint,
+        condition_fingerprint=condition_fingerprint,
+        bucket=bucket,
+        speaker_context_len=speaker_context_len,
+        branch_layouts=branch_layouts,
+        state_copies=state_copies,
+        ttl_seconds=settings.condition_cache_default_ttl_seconds,
+    )
+
+
+def _auto_prepare_speech_caches(
+    *,
+    irodori: dict[str, Any] | None,
+    runtime: Any,
+    settings: ServerSettings,
+    cache_manager: InMemoryCoreMLCacheManager,
+    segments: tuple[SpeechSegment, ...],
+    caption: str | None,
+    bucket_resolutions: list[AutoBucketResolution],
+) -> list[_SpeechCacheResolution]:
+    if not settings.auto_prepare_default_cache:
+        return [
+            _SpeechCacheResolution(
+                condition_handle=None,
+                reference_cache_id=None,
+                reference_created=False,
+                condition_created=False,
+                bucket=bucket_resolution.bucket,
+                auto_status="miss-fallback",
+                fallback_reason=(
+                    bucket_resolution.reason
+                    if bucket_resolution.bucket is None
+                    else "auto-prepare-disabled"
+                ),
+            )
+            for bucket_resolution in bucket_resolutions
+        ]
+    if not settings.enable_resident_reference_cache:
+        return [
+            _SpeechCacheResolution(
+                condition_handle=None,
+                reference_cache_id=None,
+                reference_created=False,
+                condition_created=False,
+                bucket=bucket_resolution.bucket,
+                auto_status="miss-fallback",
+                fallback_reason=(
+                    bucket_resolution.reason
+                    if bucket_resolution.bucket is None
+                    else "resident_reference_disabled"
+                ),
+            )
+            for bucket_resolution in bucket_resolutions
+        ]
+
+    has_workable_bucket = any(
+        bucket_resolution.bucket is not None for bucket_resolution in bucket_resolutions
+    )
+    reference_handle: Any | None = None
+    reference_failure_reason: str | None = None
+    if has_workable_bucket:
+        try:
+            resident_plan = _prepare_runtime_default_reference_plan(runtime, settings)
+            reference_result = _materialize_runtime_default_reference_resident(
+                runtime,
+                settings,
+                cache_manager,
+                resident_plan,
+                cache_mode=CACHE_MODE_CREATE_OR_REUSE,
+            )
+            reference_handle = reference_result.handle
+        except CACHE_EXCEPTIONS:
+            if settings.strict_coreml:
+                raise
+            reference_failure_reason = "reference-prepare-failed"
+        except CoreMLStatefulUnavailableError:
+            if settings.strict_coreml:
+                raise
+            reference_failure_reason = "coreml-stateful-unavailable"
+        except RuntimeError:
+            if settings.strict_coreml:
+                raise
+            reference_failure_reason = "reference-prepare-failed"
+
+    resolutions: list[_SpeechCacheResolution] = []
+    for segment, bucket_resolution in zip(segments, bucket_resolutions, strict=True):
+        if bucket_resolution.bucket is None:
+            resolutions.append(
+                _SpeechCacheResolution(
+                    condition_handle=None,
+                    reference_cache_id=None,
+                    reference_created=False,
+                    condition_created=False,
+                    bucket=None,
+                    auto_status="miss-fallback",
+                    fallback_reason=bucket_resolution.reason,
+                ),
+            )
+            continue
+        if reference_handle is None:
+            resolutions.append(
+                _SpeechCacheResolution(
+                    condition_handle=None,
+                    reference_cache_id=None,
+                    reference_created=False,
+                    condition_created=False,
+                    bucket=bucket_resolution.bucket,
+                    auto_status="miss-fallback",
+                    fallback_reason=reference_failure_reason
+                    or "reference-prepare-failed",
+                ),
+            )
+            continue
+        try:
+            planning = _auto_planning_for_segment(bucket_resolution, segment, runtime)
+            condition_request = _auto_internal_condition_cache_request(
+                irodori=irodori,
+                settings=settings,
+                runtime=runtime,
+                reference_handle=reference_handle,
+                bucket=bucket_resolution.bucket,
+                planning=planning,
+                caption=caption,
+            )
+            condition_result = cache_manager.prepare_condition_cache(
+                condition_request,
+                cache_mode=CACHE_MODE_CREATE_OR_REUSE,
+            )
+        except CACHE_EXCEPTIONS:
+            if settings.strict_coreml:
+                raise
+            resolutions.append(
+                _SpeechCacheResolution(
+                    condition_handle=None,
+                    reference_cache_id=None,
+                    reference_created=False,
+                    condition_created=False,
+                    bucket=bucket_resolution.bucket,
+                    auto_status="miss-fallback",
+                    fallback_reason="condition-prepare-failed",
+                ),
+            )
+            continue
+        except CoreMLStatefulUnavailableError:
+            if settings.strict_coreml:
+                raise
+            resolutions.append(
+                _SpeechCacheResolution(
+                    condition_handle=None,
+                    reference_cache_id=None,
+                    reference_created=False,
+                    condition_created=False,
+                    bucket=bucket_resolution.bucket,
+                    auto_status="miss-fallback",
+                    fallback_reason="coreml-stateful-unavailable",
+                ),
+            )
+            continue
+        resolutions.append(
+            _SpeechCacheResolution(
+                condition_handle=condition_result.handle,
+                reference_cache_id=reference_handle.id,
+                reference_created=False,
+                condition_created=not condition_result.reused,
+                bucket=bucket_resolution.bucket,
+                auto_status="reused" if condition_result.reused else "prepared",
+            ),
+        )
+    return resolutions
+
+
+def _aggregate_backend_header(segment_backends: list[str]) -> str:
+    if not segment_backends:
+        return "pytorch"
+    unique_backends = set(segment_backends)
+    if unique_backends == {"coreml-stateful"}:
+        return "coreml-stateful"
+    if unique_backends == {"pytorch"}:
+        return "pytorch"
+    return "mixed"
+
+
+def _summarize_cache_id_header(cache_ids: list[str]) -> str | None:
+    if not cache_ids:
+        return None
+    if len(cache_ids) >= 6:
+        return f"{cache_ids[0]},+{len(cache_ids) - 1} more"
+    return ",".join(cache_ids)
+
+
+def _summarize_header_values(values: list[str | None]) -> str | None:
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    if len(set(present)) == 1:
+        return present[0]
+    return "mixed"
+
+
+def _bucket_headers_for_resolutions(resolutions: list[_SpeechCacheResolution]) -> list[str]:
+    return [
+        _bucket_header_value(resolution.bucket)
+        for resolution in resolutions
+        if resolution.bucket is not None
+    ]
 
 
 def _required_text(payload: dict[str, Any], field: str) -> str:
@@ -1400,10 +2125,46 @@ def _health_payload(settings: ServerSettings, state: RuntimeState) -> dict[str, 
     }
 
 
+def _warmup_resident_speaker_kv(
+    runtime: Any,
+    reference_cache_id: str,
+    buckets: list[CoreMLConditionBucket],
+) -> int:
+    warmup = getattr(runtime, "warmup_resident_speaker_kv", None)
+    get_resident = getattr(runtime, "get_resident_reference_tensors", None)
+    if not callable(warmup) or not callable(get_resident):
+        return 0
+    resident = get_resident(reference_cache_id)
+    if resident is None:
+        return 0
+    warmed = 0
+    for bucket in buckets:
+        try:
+            warmup(
+                resident_reference=resident,
+                sequence_length_bucket=int(bucket.sequence_length),
+                speaker_context_len_bucket=int(bucket.speaker_context_len_bucket),
+            )
+            warmed += 1
+        except Exception as exc:
+            print(
+                f"[lifespan] resident speaker KV warmup failed for "
+                f"S={bucket.sequence_length},R={bucket.speaker_context_len_bucket}: {exc}"
+            )
+    return warmed
+
+
 def create_app(settings: ServerSettings) -> FastAPI:
     state = RuntimeState(settings)
+
+    def prune_runtime_resident_reference(cache_id: str) -> None:
+        runtime = state.runtime_if_loaded
+        if runtime is not None:
+            _delete_runtime_resident_reference(runtime, cache_id)
+
     cache_manager = InMemoryCoreMLCacheManager(
         max_memory_bytes=settings.cache_max_memory_bytes,
+        on_reference_removed=prune_runtime_resident_reference,
     )
 
     @asynccontextmanager
@@ -1414,10 +2175,55 @@ def create_app(settings: ServerSettings) -> FastAPI:
             if settings.warmup_buckets:
                 precompile = getattr(runtime, "precompile_coreml_stateful_buckets", None)
                 if callable(precompile):
-                    await asyncio.to_thread(
-                        precompile,
+                    try:
+                        await asyncio.to_thread(
+                            precompile,
+                            list(settings.warmup_buckets),
+                        )
+                    except CoreMLStatefulUnavailableError as exc:
+                        if settings.strict_coreml:
+                            raise
+                        print(
+                            "[lifespan] CoreML stateful warmup unavailable; "
+                            f"continuing without precompiled buckets: {exc}",
+                        )
+            reference_result: CacheCreateResult | None = None
+            if (
+                settings.default_reference_cache_prepare
+                and settings.enable_resident_reference_cache
+            ):
+                reference_result = await asyncio.to_thread(
+                    _prepare_runtime_default_reference_resident,
+                    runtime,
+                    settings,
+                    cache_manager,
+                )
+                print(
+                    "[lifespan] default reference resident prepared: "
+                    f"{reference_result.handle.id}",
+                )
+            if (
+                settings.enable_resident_speaker_kv
+                and settings.warmup_buckets
+                and reference_result is not None
+            ):
+                try:
+                    warmed = await asyncio.to_thread(
+                        _warmup_resident_speaker_kv,
+                        runtime,
+                        reference_result.handle.id,
                         list(settings.warmup_buckets),
                     )
+                    print(
+                        f"[lifespan] resident speaker KV warmup buckets prepared: {warmed}",
+                    )
+                except Exception as exc:
+                    print(f"[lifespan] resident speaker KV warmup skipped: {exc}")
+            if settings.default_condition_cache_prepare_text:
+                print(
+                    "[lifespan] default_condition_cache_prepare_text is informational; "
+                    "no condition warmup is performed in this build.",
+                )
         try:
             yield
         finally:
@@ -1515,15 +2321,27 @@ def create_app(settings: ServerSettings) -> FastAPI:
     async def cache_metrics() -> JSONResponse:
         snapshot = cache_manager.metrics_snapshot()
         runtime_metrics: list[dict[str, Any]] = []
+        resident_reference_metrics: dict[str, Any] = {}
+        resident_speaker_kv_metrics: dict[str, Any] = {}
         runtime = state.runtime_if_loaded
         if runtime is not None:
             metrics_fn = getattr(runtime, "coreml_stateful_metrics_snapshot", None)
             if callable(metrics_fn):
                 runtime_metrics = list(metrics_fn())
+            resident_metrics_fn = getattr(runtime, "resident_reference_metrics_snapshot", None)
+            if callable(resident_metrics_fn):
+                resident_reference_metrics = dict(resident_metrics_fn())
+            speaker_kv_metrics_fn = getattr(
+                runtime, "resident_speaker_kv_metrics_snapshot", None
+            )
+            if callable(speaker_kv_metrics_fn):
+                resident_speaker_kv_metrics = dict(speaker_kv_metrics_fn())
         return JSONResponse(
             content={
                 "cache_manager": snapshot,
                 "coreml_stateful_backends": runtime_metrics,
+                "resident_references": resident_reference_metrics,
+                "resident_speaker_kv": resident_speaker_kv_metrics,
             },
         )
 
@@ -1562,10 +2380,39 @@ def create_app(settings: ServerSettings) -> FastAPI:
         seed = _optional_int(data, "seed", None)
         caption = _resolve_caption(data)
         segment_plan = _build_speech_segment_plan(data, text, settings)
-        condition_cache_handle: ConditionCacheHandle | None = None
-        cache_resolution = _SpeechCacheResolution(None, None, False, False)
+        cache_resolutions = [
+            _SpeechCacheResolution(None, None, False, False) for _segment in segment_plan.segments
+        ]
+        auto_bucket_resolutions: list[AutoBucketResolution] = []
+        runtime: Any | None = None
+        resident_reference_plan: _ResidentReferencePlan | None = None
         try:
-            cache_resolution = _resolve_speech_cache(
+            if cache_mode in {CACHE_MODE_PREPARE, CACHE_MODE_REFRESH}:
+                if len(segment_plan.segments) != 1:
+                    raise CacheConflictError(
+                        "cache_mode=prepare/refresh does not support multi-segment speech",
+                    )
+                _speech_condition_cache_request(
+                    irodori or {},
+                    settings,
+                    "ref_prevalidate",
+                    1,
+                    segment_plan.segments[0],
+                    caption,
+                )
+                if not settings.reference_wav.is_file():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Configured reference_wav not found: {settings.reference_wav}",
+                    )
+                runtime = await asyncio.to_thread(state.get_runtime)
+                resident_reference_plan = await asyncio.to_thread(
+                    _prepare_runtime_default_reference_plan,
+                    runtime,
+                    settings,
+                    force_refresh=cache_mode == CACHE_MODE_REFRESH,
+                )
+            cache_resolutions = _resolve_speech_cache(
                 irodori,
                 str(cache_mode),
                 cache_id,
@@ -1573,10 +2420,31 @@ def create_app(settings: ServerSettings) -> FastAPI:
                 caption,
                 settings,
                 cache_manager,
+                runtime=runtime,
+                resident_reference_plan=resident_reference_plan,
             )
-            condition_cache_handle = cache_resolution.condition_handle
+            if len(cache_resolutions) != len(segment_plan.segments):
+                raise CacheConflictError("speech cache resolution count did not match segments")
         except CACHE_EXCEPTIONS as exc:
+            if runtime is not None and resident_reference_plan is not None:
+                _delete_runtime_resident_reference(runtime, resident_reference_plan.provisional_id)
             return _cache_error_response(exc, cache_id=cache_id, cache_mode=cache_mode)
+        except CoreMLStatefulUnavailableError as exc:
+            if runtime is not None and resident_reference_plan is not None:
+                _delete_runtime_resident_reference(runtime, resident_reference_plan.provisional_id)
+            return _coreml_backend_error_response(
+                exc,
+                cache_id=cache_id,
+                cache_mode=cache_mode,
+            )
+        except ValueError as exc:
+            if runtime is not None and resident_reference_plan is not None:
+                _delete_runtime_resident_reference(runtime, resident_reference_plan.provisional_id)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if runtime is not None and resident_reference_plan is not None:
+                _delete_runtime_resident_reference(runtime, resident_reference_plan.provisional_id)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         if not settings.reference_wav.is_file():
             raise HTTPException(
@@ -1585,20 +2453,39 @@ def create_app(settings: ServerSettings) -> FastAPI:
             )
 
         try:
-            runtime = await asyncio.to_thread(state.get_runtime)
+            if runtime is None:
+                runtime = await asyncio.to_thread(state.get_runtime)
+            if cache_mode == CACHE_MODE_AUTO and cache_id is None:
+                auto_bucket_resolutions = await asyncio.to_thread(
+                    _resolve_auto_bucket_resolutions,
+                    irodori,
+                    segment_plan.segments,
+                    runtime,
+                )
+                cache_resolutions = await asyncio.to_thread(
+                    _auto_prepare_speech_caches,
+                    irodori=irodori,
+                    runtime=runtime,
+                    settings=settings,
+                    cache_manager=cache_manager,
+                    segments=segment_plan.segments,
+                    caption=caption,
+                    bucket_resolutions=auto_bucket_resolutions,
+                )
             audio_segments: list[Any] = []
             sample_rate: int | None = None
             channel_count: int | None = None
-            denoiser_backend = (
-                "coreml-stateful" if condition_cache_handle is not None else "pytorch"
-            )
-            condition_cache_id_header = (
-                condition_cache_handle.id if condition_cache_handle is not None else None
-            )
+            segment_backends: list[str] = []
+            used_condition_cache_ids: list[str] = []
+            used_reference_cache_ids: list[str] = []
             fast_path_cfg = (
-                _speech_fast_path_cfg(irodori) if condition_cache_handle is not None else None
+                _speech_fast_path_cfg(irodori)
+                if any(resolution.condition_handle is not None for resolution in cache_resolutions)
+                else None
             )
             for segment_index, segment in enumerate(segment_plan.segments):
+                cache_resolution = cache_resolutions[segment_index]
+                condition_cache_handle = cache_resolution.condition_handle
                 segment_seed = None if seed is None else int(seed) + segment_index
                 sampling_request = SamplingRequest(
                     text=segment.text,
@@ -1611,7 +2498,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
                     max_ref_seconds=settings.max_ref_seconds,
                     seed=segment_seed,
                 )
-                if fast_path_cfg is not None:
+                if condition_cache_handle is not None and fast_path_cfg is not None:
                     sampling_request.cfg_guidance_mode = str(fast_path_cfg["guidance_mode"])
                     sampling_request.cfg_scale_text = float(fast_path_cfg["scale_text"])
                     sampling_request.cfg_scale_caption = float(fast_path_cfg["scale_caption"])
@@ -1637,6 +2524,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
                         sampling_request,
                         log_fn=print if settings.log_timings else None,
                     )
+                    segment_backends.append("pytorch")
                 else:
                     try:
                         synthesize_with_condition_cache = getattr(
@@ -1648,22 +2536,50 @@ def create_app(settings: ServerSettings) -> FastAPI:
                             raise CoreMLStatefulUnavailableError(
                                 "runtime does not expose synthesize_with_condition_cache"
                             )
+                        resident_reference_tensors = None
+                        if cache_resolution.reference_cache_id is not None:
+                            get_resident_reference = getattr(
+                                runtime,
+                                "get_resident_reference_tensors",
+                                None,
+                            )
+                            if callable(get_resident_reference):
+                                resident_reference_tensors = get_resident_reference(
+                                    cache_resolution.reference_cache_id,
+                                )
+                        synthesize_kwargs: dict[str, Any] = {
+                            "condition_cache": condition_cache_handle,
+                            "log_fn": print if settings.log_timings else None,
+                        }
+                        if resident_reference_tensors is not None:
+                            synthesize_kwargs["resident_reference_tensors"] = (
+                                resident_reference_tensors
+                            )
                         result = await asyncio.to_thread(
                             synthesize_with_condition_cache,
                             sampling_request,
-                            condition_cache=condition_cache_handle,
-                            log_fn=print if settings.log_timings else None,
+                            **synthesize_kwargs,
                         )
+                        segment_backends.append("coreml-stateful")
+                        used_condition_cache_ids.append(condition_cache_handle.id)
+                        if cache_resolution.reference_cache_id is not None:
+                            used_reference_cache_ids.append(
+                                cache_resolution.reference_cache_id,
+                            )
                     except CoreMLStatefulUnavailableError:
-                        if cache_mode != CACHE_MODE_AUTO:
+                        if cache_mode != CACHE_MODE_AUTO or settings.strict_coreml:
                             raise
-                        denoiser_backend = "pytorch"
-                        condition_cache_id_header = None
+                        cache_resolutions[segment_index] = replace(
+                            cache_resolution,
+                            auto_status="miss-fallback",
+                            fallback_reason="coreml-stateful-unavailable",
+                        )
                         result = await asyncio.to_thread(
                             runtime.synthesize,
                             sampling_request,
                             log_fn=print if settings.log_timings else None,
                         )
+                        segment_backends.append("pytorch")
                 audio = _normalize_audio_segment(result.audio)
                 result_sample_rate = int(result.sample_rate)
                 result_channel_count = int(audio.shape[0])
@@ -1682,6 +2598,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
             audio_bytes = _serialize_audio(audio, sample_rate, output_format)
         except HTTPException:
             raise
+        except CACHE_EXCEPTIONS as exc:
+            return _cache_error_response(exc, cache_id=cache_id, cache_mode=cache_mode)
         except CoreMLStatefulUnavailableError as exc:
             return _coreml_backend_error_response(
                 exc,
@@ -1691,10 +2609,17 @@ def create_app(settings: ServerSettings) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        denoiser_backend = _aggregate_backend_header(segment_backends)
+        condition_cache_id_header = _summarize_cache_id_header(used_condition_cache_ids)
+        reference_cache_id_header = _summarize_cache_id_header(
+            list(dict.fromkeys(used_reference_cache_ids)),
+        )
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{output_format}"',
             "X-Irodori-Requested-Format": requested_format,
+            "X-Irodori-Voice-Resolved": "server-default",
             "X-Irodori-Denoiser-Backend": denoiser_backend,
+            "X-Irodori-Backend": denoiser_backend,
             "X-Irodori-Generation-Seconds": _format_seconds_header(segment_plan.total_seconds),
             "X-Irodori-Seconds-Mode": segment_plan.seconds_mode,
             "X-Irodori-Chunk-Count": str(len(segment_plan.segments)),
@@ -1703,14 +2628,38 @@ def create_app(settings: ServerSettings) -> FastAPI:
             ),
             "X-Irodori-Num-Steps": str(int(num_steps)),
         }
+        if len(segment_backends) > 1 or denoiser_backend == "mixed":
+            headers["X-Irodori-Backend-Per-Segment"] = ",".join(segment_backends)
         if condition_cache_id_header is not None:
             headers["X-Irodori-Condition-Cache-Id"] = condition_cache_id_header
-        if (
-            cache_resolution.reference_cache_id is not None
-            and condition_cache_id_header is not None
-            and cache_mode in {CACHE_MODE_PREPARE, CACHE_MODE_REFRESH}
-        ):
-            headers["X-Irodori-Reference-Cache-Id"] = cache_resolution.reference_cache_id
+            headers["X-Irodori-Cache-Condition-Id"] = condition_cache_id_header
+            headers["X-Irodori-Cache-Condition-Count"] = str(
+                len(used_condition_cache_ids),
+            )
+        if reference_cache_id_header is not None and condition_cache_id_header is not None:
+            headers["X-Irodori-Reference-Cache-Id"] = reference_cache_id_header
+            headers["X-Irodori-Cache-Reference-Id"] = reference_cache_id_header
+        if cache_mode == CACHE_MODE_AUTO:
+            auto_status = _summarize_header_values(
+                [resolution.auto_status for resolution in cache_resolutions],
+            )
+            if auto_status is not None:
+                headers["X-Irodori-Cache-Auto"] = auto_status
+        bucket_headers = _bucket_headers_for_resolutions(cache_resolutions)
+        if bucket_headers:
+            headers["X-Irodori-Bucket"] = ",".join(bucket_headers)
+        fallback_reason = _summarize_header_values(
+            [resolution.fallback_reason for resolution in cache_resolutions],
+        )
+        if fallback_reason is not None:
+            headers["X-Irodori-Fallback-Reason"] = fallback_reason
+        bucket_attempted_headers = [
+            auto_bucket_resolution.attempted
+            for auto_bucket_resolution in auto_bucket_resolutions
+            if auto_bucket_resolution.attempted is not None
+        ]
+        if bucket_attempted_headers:
+            headers["X-Irodori-Bucket-Attempted"] = ",".join(bucket_attempted_headers)
         return Response(
             content=audio_bytes,
             media_type=_content_type(output_format),
@@ -1720,7 +2669,29 @@ def create_app(settings: ServerSettings) -> FastAPI:
     return app
 
 
-def parse_args() -> argparse.Namespace:
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if value in {"0", "false", "no", "off", "n", "f"}:
+        return False
+    raise ValueError(f"{name} must be a boolean (true/false), got {raw!r}")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     default_device = _prefer_mps_device()
     parser = argparse.ArgumentParser(description="OpenAI-compatible HTTP TTS API for Irodori-TTS.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1781,7 +2752,83 @@ def parse_args() -> argparse.Namespace:
             "Example: --warmup-bucket S=100,T=256,R=160"
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--auto-prepare-default-cache",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("IRODORI_AUTO_PREPARE_DEFAULT_CACHE", True),
+        help=(
+            "Auto-prepare condition cache for AUTO requests without cache_id. "
+            "When false, AUTO requests fall back to PyTorch instead of preparing condition caches."
+        ),
+    )
+    parser.add_argument(
+        "--strict-coreml",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("IRODORI_STRICT_COREML", False),
+        help=(
+            "When true, AUTO requests return strict errors instead of silently falling back "
+            "to PyTorch on CoreML/cache prep failures."
+        ),
+    )
+    parser.add_argument(
+        "--default-reference-cache-prepare",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prepare default reference resident tensors during lifespan startup.",
+    )
+    parser.add_argument(
+        "--default-condition-cache-prepare-text",
+        type=str,
+        default=None,
+        help="Optional warmup text to log a best-effort default condition cache prep on startup.",
+    )
+    parser.add_argument(
+        "--condition-cache-default-ttl-seconds",
+        type=float,
+        default=86400.0,
+        help=(
+            "TTL (seconds) for internally-prepared AUTO condition caches. "
+            "Use <=0 to disable TTL (None)."
+        ),
+    )
+    parser.add_argument(
+        "--max-resident-speaker-kv-buckets",
+        type=int,
+        default=_env_int("IRODORI_MAX_RESIDENT_SPEAKER_KV_BUCKETS", 3),
+        help="Maximum resident speaker KV bucket entries kept in the runtime pool.",
+    )
+    parser.add_argument(
+        "--max-resident-condition-cache-entries",
+        type=int,
+        default=_env_int("IRODORI_MAX_RESIDENT_CONDITION_CACHE_ENTRIES", 0),
+        help="Reserved for layer-4 condition packed-KV residency. 0 disables.",
+    )
+    parser.add_argument(
+        "--enable-resident-reference-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When false, AUTO requests bypass resident reference cache prep and fall back "
+            "to PyTorch (no metadata-only CoreML path)."
+        ),
+    )
+    parser.add_argument(
+        "--enable-resident-speaker-kv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable runtime-resident speaker KV pool. When false, fresh build per request.",
+    )
+    parser.add_argument(
+        "--enable-condition-packed-kv-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reserved for layer-4 packed-KV residency. Currently unimplemented.",
+    )
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 def _parse_warmup_bucket_spec(spec: str) -> CoreMLConditionBucket:
@@ -1805,8 +2852,7 @@ def _parse_warmup_bucket_spec(spec: str) -> CoreMLConditionBucket:
     )
 
 
-def main() -> None:
-    args = parse_args()
+def build_settings_from_args(args: argparse.Namespace) -> ServerSettings:
     if int(args.default_num_steps) <= 0:
         raise ValueError("--default-num-steps must be > 0.")
     if int(args.max_num_steps) <= 0:
@@ -1830,7 +2876,23 @@ def main() -> None:
     if cache_max_memory_bytes is not None and cache_max_memory_bytes <= 0:
         raise ValueError("--cache-max-memory-bytes must be > 0 when supplied.")
     warmup_buckets = tuple(_parse_warmup_bucket_spec(spec) for spec in (args.warmup_bucket or []))
-    settings = ServerSettings(
+
+    ttl_raw = float(args.condition_cache_default_ttl_seconds)
+    if math.isnan(ttl_raw) or math.isinf(ttl_raw):
+        raise ValueError("--condition-cache-default-ttl-seconds must be finite.")
+    condition_cache_default_ttl_seconds: float | None = None if ttl_raw <= 0 else ttl_raw
+
+    max_resident_speaker_kv_buckets = int(args.max_resident_speaker_kv_buckets)
+    if max_resident_speaker_kv_buckets < 0:
+        raise ValueError("--max-resident-speaker-kv-buckets must be >= 0.")
+    max_resident_condition_cache_entries = int(args.max_resident_condition_cache_entries)
+    if max_resident_condition_cache_entries < 0:
+        raise ValueError("--max-resident-condition-cache-entries must be >= 0.")
+
+    prepare_text_raw = args.default_condition_cache_prepare_text
+    prepare_text = None if prepare_text_raw is None else str(prepare_text_raw).strip() or None
+
+    return ServerSettings(
         host=str(args.host),
         port=int(args.port),
         checkpoint=str(args.checkpoint),
@@ -1853,7 +2915,21 @@ def main() -> None:
         log_timings=bool(args.log_timings),
         cache_max_memory_bytes=cache_max_memory_bytes,
         warmup_buckets=warmup_buckets,
+        auto_prepare_default_cache=bool(args.auto_prepare_default_cache),
+        strict_coreml=bool(args.strict_coreml),
+        default_reference_cache_prepare=bool(args.default_reference_cache_prepare),
+        default_condition_cache_prepare_text=prepare_text,
+        condition_cache_default_ttl_seconds=condition_cache_default_ttl_seconds,
+        max_resident_speaker_kv_buckets=max_resident_speaker_kv_buckets,
+        max_resident_condition_cache_entries=max_resident_condition_cache_entries,
+        enable_resident_reference_cache=bool(args.enable_resident_reference_cache),
+        enable_resident_speaker_kv=bool(args.enable_resident_speaker_kv),
+        enable_condition_packed_kv_cache=bool(args.enable_condition_packed_kv_cache),
     )
+
+
+def main() -> None:
+    settings = build_settings_from_args(parse_args())
     _validate_reference_wav(settings.reference_wav)
 
     import uvicorn

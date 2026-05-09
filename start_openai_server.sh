@@ -9,4 +9,8 @@ cd "$SCRIPT_DIR"
 exec uv run python openai_api_server.py \
   --host "$IRODORI_TTS_HOST" \
   --port "$IRODORI_TTS_PORT" \
+  --preload \
+  --warmup-bucket S=100,T=256,R=160 \
+  --warmup-bucket S=160,T=256,R=160 \
+  --warmup-bucket S=200,T=256,R=160 \
   "$@"

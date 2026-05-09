@@ -368,6 +368,27 @@ def test_prune_expired_removes_expired_references_and_dependent_conditions() -> 
         manager.get_condition_cache(expiring_condition.id)
 
 
+def test_prune_expired_reference_invokes_reference_removed_callback() -> None:
+    clock = Clock()
+    removed: list[str] = []
+    manager = coreml_cache.InMemoryCoreMLCacheManager(
+        clock=clock,
+        on_reference_removed=removed.append,
+    )
+    expired_reference = manager.prepare_reference_cache(
+        reference_request(reference_fingerprint="reference-expiring", ttl_seconds=5),
+    ).handle
+    live_reference = manager.prepare_reference_cache(
+        reference_request(reference_fingerprint="reference-live"),
+    ).handle
+
+    clock.advance(5)
+
+    assert manager.prune_expired() == {"reference": 1, "condition": 0}
+    assert removed == [expired_reference.id]
+    assert manager.peek_reference_cache(live_reference.id) is live_reference
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -469,6 +490,28 @@ def test_lru_eviction_removes_least_recently_used_condition_first() -> None:
     with pytest.raises(coreml_cache.CacheNotFoundError):
         manager.get_condition_cache(older.id)
     assert manager.get_condition_cache(newer.id) is newer
+
+
+def test_lru_reference_eviction_invokes_reference_removed_callback() -> None:
+    clock = Clock()
+    removed: list[str] = []
+    manager = coreml_cache.InMemoryCoreMLCacheManager(
+        clock=clock,
+        max_memory_bytes=150,
+        on_reference_removed=removed.append,
+    )
+    older = manager.prepare_reference_cache(
+        reference_request(reference_fingerprint="older", memory_bytes=100),
+    ).handle
+    clock.advance(1)
+    newer = manager.prepare_reference_cache(
+        reference_request(reference_fingerprint="newer", memory_bytes=100),
+    ).handle
+
+    assert removed == [older.id]
+    with pytest.raises(coreml_cache.CacheNotFoundError):
+        manager.peek_reference_cache(older.id)
+    assert manager.peek_reference_cache(newer.id) is newer
 
 
 def test_required_condition_cache_is_kept_over_older_unused_caches() -> None:

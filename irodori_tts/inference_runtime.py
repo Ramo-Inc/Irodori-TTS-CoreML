@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
 import secrets
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Hashable
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -35,10 +37,13 @@ from .coreml_stateful import (
     pack_context_kv_state,
 )
 from .lora import checkpoint_state_uses_lora
-from .model import TextToLatentRFDiT
+from .model import TextToLatentRFDiT, patch_sequence_with_mask
 from .rf import _make_rng, sample_euler_rf_cfg, scale_speaker_kv_cache, temporal_score_rescale
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
+
+_RESIDENT_PREPARE_LOCK_STRIPE_COUNT = 64
+_RESIDENT_SPEAKER_KV_DEFAULT_MAX_ENTRIES = 3
 
 
 def _is_mps_available() -> bool:
@@ -115,6 +120,11 @@ def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) 
     return time.perf_counter() - t0
 
 
+def _resident_prepare_lock_stripe_index(key: Hashable, stripe_count: int) -> int:
+    digest = hashlib.sha256(repr(key).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % stripe_count
+
+
 def _coerce_latent_shape(latent: torch.Tensor, latent_dim: int) -> torch.Tensor:
     if latent.ndim == 3 and latent.shape[0] == 1:
         latent = latent[0]
@@ -180,6 +190,29 @@ class RuntimeKey:
     compile_dynamic: bool = False
 
 
+def _patched_steps_for_seconds(
+    seconds: float,
+    sample_rate: int,
+    hop_length: int,
+    latent_patch_size: int,
+) -> int:
+    if not math.isfinite(float(seconds)) or float(seconds) <= 0.0:
+        raise ValueError(f"seconds must be > 0, got {seconds}")
+    sample_rate_int = int(sample_rate)
+    hop_length_int = int(hop_length)
+    latent_patch_size_int = int(latent_patch_size)
+    if sample_rate_int <= 0:
+        raise ValueError(f"sample_rate must be > 0, got {sample_rate}")
+    if hop_length_int <= 0:
+        raise ValueError(f"hop_length must be > 0, got {hop_length}")
+    if latent_patch_size_int <= 0:
+        raise ValueError(f"latent_patch_size must be > 0, got {latent_patch_size}")
+
+    target_samples = int(float(seconds) * sample_rate_int)
+    latent_steps = math.ceil(target_samples / hop_length_int)
+    return math.ceil(latent_steps / latent_patch_size_int)
+
+
 @dataclass
 class SamplingRequest:
     text: str
@@ -226,6 +259,83 @@ class SamplingResult:
     total_to_decode: float
     used_seed: int
     messages: list[str]
+
+
+@dataclass(frozen=True)
+class ResidentReferenceTensors:
+    reference_cache_id: str
+    ref_latent: torch.Tensor
+    ref_mask: torch.Tensor
+    speaker_state: torch.Tensor
+    speaker_mask: torch.Tensor
+    reference_fingerprint: str | None
+    source: str
+    ref_len: int
+    speaker_context_len: int
+    speaker_dim: int
+    memory_bytes: int
+    device: str
+    dtype: str
+    created_at: datetime
+    last_used_at: datetime
+
+
+ResidentSpeakerKVScaleSignature = tuple[float, int | None] | None
+
+
+@dataclass(frozen=True)
+class ResidentSpeakerKVPayload:
+    key: tuple
+    reference_cache_id: str
+    reference_fingerprint: str | None
+    sequence_length_bucket: int
+    speaker_context_len_bucket: int
+    branch_layout: str
+    scale_signature: ResidentSpeakerKVScaleSignature
+    speaker_kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    memory_bytes: int
+    created_at: datetime
+    last_used_at: datetime
+
+
+def merge_text_and_speaker_context_kv(
+    text_kv_cache: list[tuple[torch.Tensor, torch.Tensor]]
+    | tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    speaker_kv_cache: list[tuple[torch.Tensor, torch.Tensor]]
+    | tuple[tuple[torch.Tensor, torch.Tensor], ...],
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Combine per-layer text-only and speaker-only KV caches into the build_context_kv_cache layout."""
+    if len(text_kv_cache) != len(speaker_kv_cache):
+        raise ValueError(
+            "merge_text_and_speaker_context_kv layer count mismatch: "
+            f"text={len(text_kv_cache)} speaker={len(speaker_kv_cache)}"
+        )
+    merged: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for layer_idx, (text_layer, speaker_layer) in enumerate(
+        zip(text_kv_cache, speaker_kv_cache, strict=True)
+    ):
+        if len(text_layer) != 2:
+            raise ValueError(
+                f"text KV layer {layer_idx} must contain (k, v); got {len(text_layer)} tensors"
+            )
+        if len(speaker_layer) != 2:
+            raise ValueError(
+                f"speaker KV layer {layer_idx} must contain (k, v); got {len(speaker_layer)} tensors"
+            )
+        k_text, v_text = text_layer
+        k_speaker, v_speaker = speaker_layer
+        merged.append((k_text, v_text, k_speaker, v_speaker))
+    return merged
+
+
+def _tensor_memory_bytes(*tensors: torch.Tensor | None) -> int:
+    return int(
+        sum(
+            int(tensor.numel()) * int(tensor.element_size())
+            for tensor in tensors
+            if tensor is not None
+        )
+    )
 
 
 def _default_coreml_stateful_backend_factory(
@@ -453,6 +563,110 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
         self._coreml_stateful_backends: dict[tuple[int, int, str, str], object] = {}
         self._coreml_stateful_backends_lock = threading.Lock()
+        self._runtime_resident_lock = threading.RLock()
+        self._resident_prepare_locks = tuple(
+            threading.RLock() for _ in range(_RESIDENT_PREPARE_LOCK_STRIPE_COUNT)
+        )
+        self._resident_reference_tensors: dict[str, ResidentReferenceTensors] = {}
+        self._resident_reference_metrics: dict[str, int] = {
+            "reference_encode_calls": 0,
+            "speaker_state_encode_calls": 0,
+            "resident_reference_hits": 0,
+            "resident_reference_misses": 0,
+            "resident_reference_prepares": 0,
+            "resident_reference_deletes": 0,
+        }
+        self._resident_speaker_kv_store: dict[tuple, ResidentSpeakerKVPayload] = {}
+        self._resident_speaker_kv_metrics: dict[str, int] = {
+            "speaker_kv_projection_calls": 0,
+            "resident_speaker_kv_hits": 0,
+            "resident_speaker_kv_misses": 0,
+            "resident_speaker_kv_prepares": 0,
+            "resident_speaker_kv_evictions": 0,
+            "resident_speaker_kv_deletes": 0,
+        }
+        self._resident_speaker_kv_max_entries = int(_RESIDENT_SPEAKER_KV_DEFAULT_MAX_ENTRIES)
+        self._resident_speaker_kv_enabled = True
+
+    def configure_resident_speaker_kv(
+        self,
+        *,
+        enabled: bool | None = None,
+        max_entries: int | None = None,
+    ) -> None:
+        with self._runtime_resident_registry_lock():
+            if enabled is not None:
+                self._resident_speaker_kv_enabled = bool(enabled)
+            if max_entries is not None:
+                if int(max_entries) < 0:
+                    raise ValueError("max_entries must be >= 0")
+                self._resident_speaker_kv_max_entries = int(max_entries)
+                self._evict_resident_speaker_kv_if_needed_locked()
+
+    @property
+    def resident_speaker_kv_enabled(self) -> bool:
+        return bool(getattr(self, "_resident_speaker_kv_enabled", True))
+
+    @property
+    def resident_speaker_kv_max_entries(self) -> int:
+        return int(getattr(self, "_resident_speaker_kv_max_entries", 0))
+
+    def warmup_resident_speaker_kv(
+        self,
+        *,
+        resident_reference: ResidentReferenceTensors,
+        sequence_length_bucket: int,
+        speaker_context_len_bucket: int,
+        branch_layout: str = BRANCH_LAYOUT_COND1,
+    ) -> ResidentSpeakerKVPayload:
+        if not self.resident_speaker_kv_enabled:
+            raise RuntimeError("resident speaker KV is disabled")
+        key = self._resident_speaker_kv_key(
+            reference_cache_id=resident_reference.reference_cache_id,
+            reference_fingerprint=resident_reference.reference_fingerprint,
+            sequence_length_bucket=int(sequence_length_bucket),
+            speaker_context_len_bucket=int(speaker_context_len_bucket),
+            branch_layout=str(branch_layout),
+            scale_signature=None,
+        )
+
+        def _builder() -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+            self._increment_resident_speaker_kv_metric("speaker_kv_projection_calls")
+            with torch.inference_mode():
+                speaker_kv_list = self.model.build_speaker_context_kv_cache(
+                    speaker_state=resident_reference.speaker_state,
+                )
+            return tuple((k, v) for k, v in speaker_kv_list)
+
+        return self._ensure_resident_speaker_kv_payload(
+            key=key,
+            reference_cache_id=resident_reference.reference_cache_id,
+            reference_fingerprint=resident_reference.reference_fingerprint,
+            sequence_length_bucket=int(sequence_length_bucket),
+            speaker_context_len_bucket=int(speaker_context_len_bucket),
+            branch_layout=str(branch_layout),
+            scale_signature=None,
+            builder=_builder,
+        )
+
+    def estimate_patched_steps(self, seconds: float) -> int:
+        return _patched_steps_for_seconds(
+            seconds,
+            sample_rate=int(self.codec.sample_rate),
+            hop_length=int(self.codec.model.hop_length),
+            latent_patch_size=int(self.model_cfg.latent_patch_size),
+        )
+
+    def tokenize_for_bucket(self, normalized_text: str) -> tuple[int, str]:
+        token_ids = self.tokenizer.encode(normalized_text)
+        if hasattr(token_ids, "detach"):
+            token_id_list = [
+                int(token_id) for token_id in token_ids.detach().cpu().reshape(-1).tolist()
+            ]
+        else:
+            token_id_list = [int(token_id) for token_id in token_ids]
+        encoded = json.dumps(token_id_list, separators=(",", ":")).encode("utf-8")
+        return len(token_id_list), f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -644,6 +858,577 @@ class InferenceRuntime:
             self._coreml_stateful_backends_lock = lock
         return lock
 
+    def _runtime_resident_registry_lock(self) -> threading.RLock:
+        lock = getattr(self, "_runtime_resident_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._runtime_resident_lock = lock
+        return lock
+
+    def _resident_prepare_lock_stripes(self) -> tuple[threading.RLock, ...]:
+        with self._runtime_resident_registry_lock():
+            prepare_locks = getattr(self, "_resident_prepare_locks", None)
+            if prepare_locks is None:
+                prepare_locks = tuple(
+                    threading.RLock() for _ in range(_RESIDENT_PREPARE_LOCK_STRIPE_COUNT)
+                )
+                self._resident_prepare_locks = prepare_locks
+            return prepare_locks
+
+    def _resident_prepare_lock(self, key: Hashable) -> threading.RLock:
+        prepare_locks = self._resident_prepare_lock_stripes()
+        return prepare_locks[_resident_prepare_lock_stripe_index(key, len(prepare_locks))]
+
+    def _resident_reference_registry(self) -> dict[str, ResidentReferenceTensors]:
+        with self._runtime_resident_registry_lock():
+            registry = getattr(self, "_resident_reference_tensors", None)
+            if registry is None:
+                registry = {}
+                self._resident_reference_tensors = registry
+            return registry
+
+    def _resident_reference_metric_counters(self) -> dict[str, int]:
+        with self._runtime_resident_registry_lock():
+            metrics = getattr(self, "_resident_reference_metrics", None)
+            if metrics is None:
+                metrics = {
+                    "reference_encode_calls": 0,
+                    "speaker_state_encode_calls": 0,
+                    "resident_reference_hits": 0,
+                    "resident_reference_misses": 0,
+                    "resident_reference_prepares": 0,
+                    "resident_reference_deletes": 0,
+                }
+                self._resident_reference_metrics = metrics
+            return metrics
+
+    def _increment_resident_reference_metric(self, name: str, value: int = 1) -> None:
+        with self._runtime_resident_registry_lock():
+            metrics = self._resident_reference_metric_counters()
+            metrics[name] = int(metrics.get(name, 0)) + int(value)
+
+    def _resident_speaker_kv_store_dict(self) -> dict[tuple, ResidentSpeakerKVPayload]:
+        with self._runtime_resident_registry_lock():
+            store = getattr(self, "_resident_speaker_kv_store", None)
+            if store is None:
+                store = {}
+                self._resident_speaker_kv_store = store
+            return store
+
+    def _resident_speaker_kv_metric_counters(self) -> dict[str, int]:
+        with self._runtime_resident_registry_lock():
+            metrics = getattr(self, "_resident_speaker_kv_metrics", None)
+            if metrics is None:
+                metrics = {
+                    "speaker_kv_projection_calls": 0,
+                    "resident_speaker_kv_hits": 0,
+                    "resident_speaker_kv_misses": 0,
+                    "resident_speaker_kv_prepares": 0,
+                    "resident_speaker_kv_evictions": 0,
+                    "resident_speaker_kv_deletes": 0,
+                }
+                self._resident_speaker_kv_metrics = metrics
+            return metrics
+
+    def _increment_resident_speaker_kv_metric(self, name: str, value: int = 1) -> None:
+        with self._runtime_resident_registry_lock():
+            metrics = self._resident_speaker_kv_metric_counters()
+            metrics[name] = int(metrics.get(name, 0)) + int(value)
+
+    def _resident_speaker_kv_key(
+        self,
+        *,
+        reference_cache_id: str,
+        reference_fingerprint: str | None,
+        sequence_length_bucket: int,
+        speaker_context_len_bucket: int,
+        branch_layout: str,
+        scale_signature: ResidentSpeakerKVScaleSignature,
+    ) -> tuple:
+        return (
+            "speaker_kv",
+            str(self.key.checkpoint),
+            str(reference_cache_id),
+            None if reference_fingerprint is None else str(reference_fingerprint),
+            int(sequence_length_bucket),
+            int(speaker_context_len_bucket),
+            str(branch_layout),
+            scale_signature,
+        )
+
+    def _evict_resident_speaker_kv_if_needed_locked(self) -> None:
+        store = self._resident_speaker_kv_store_dict()
+        max_entries = int(getattr(self, "_resident_speaker_kv_max_entries", 0))
+        if max_entries <= 0:
+            return
+        metrics = self._resident_speaker_kv_metric_counters()
+        while len(store) > max_entries:
+            oldest_key = min(store, key=lambda k: store[k].last_used_at)
+            store.pop(oldest_key, None)
+            metrics["resident_speaker_kv_evictions"] = (
+                int(metrics.get("resident_speaker_kv_evictions", 0)) + 1
+            )
+
+    def _ensure_resident_speaker_kv_payload(
+        self,
+        *,
+        key: tuple,
+        reference_cache_id: str,
+        reference_fingerprint: str | None,
+        sequence_length_bucket: int,
+        speaker_context_len_bucket: int,
+        branch_layout: str,
+        scale_signature: ResidentSpeakerKVScaleSignature,
+        builder: Callable[[], tuple[tuple[torch.Tensor, torch.Tensor], ...]],
+    ) -> ResidentSpeakerKVPayload:
+        with self._resident_prepare_lock(key):
+            with self._runtime_resident_registry_lock():
+                store = self._resident_speaker_kv_store_dict()
+                existing = store.get(key)
+                if existing is not None:
+                    refreshed = replace(existing, last_used_at=datetime.now(timezone.utc))
+                    store[key] = refreshed
+                    metrics = self._resident_speaker_kv_metric_counters()
+                    metrics["resident_speaker_kv_hits"] = (
+                        int(metrics.get("resident_speaker_kv_hits", 0)) + 1
+                    )
+                    return refreshed
+                metrics = self._resident_speaker_kv_metric_counters()
+                metrics["resident_speaker_kv_misses"] = (
+                    int(metrics.get("resident_speaker_kv_misses", 0)) + 1
+                )
+
+            speaker_kv_cache = builder()
+            memory_bytes = int(
+                sum(
+                    int(tensor.numel()) * int(tensor.element_size())
+                    for layer in speaker_kv_cache
+                    for tensor in layer
+                )
+            )
+            now = datetime.now(timezone.utc)
+            payload = ResidentSpeakerKVPayload(
+                key=key,
+                reference_cache_id=str(reference_cache_id),
+                reference_fingerprint=(
+                    None if reference_fingerprint is None else str(reference_fingerprint)
+                ),
+                sequence_length_bucket=int(sequence_length_bucket),
+                speaker_context_len_bucket=int(speaker_context_len_bucket),
+                branch_layout=str(branch_layout),
+                scale_signature=scale_signature,
+                speaker_kv_cache=speaker_kv_cache,
+                memory_bytes=memory_bytes,
+                created_at=now,
+                last_used_at=now,
+            )
+            with self._runtime_resident_registry_lock():
+                store = self._resident_speaker_kv_store_dict()
+                existing = store.get(key)
+                if existing is not None:
+                    refreshed = replace(existing, last_used_at=now)
+                    store[key] = refreshed
+                    return refreshed
+                store[key] = payload
+                metrics = self._resident_speaker_kv_metric_counters()
+                metrics["resident_speaker_kv_prepares"] = (
+                    int(metrics.get("resident_speaker_kv_prepares", 0)) + 1
+                )
+                self._evict_resident_speaker_kv_if_needed_locked()
+            return payload
+
+    def _get_or_prepare_resident_speaker_kv(
+        self,
+        *,
+        speaker_state: torch.Tensor,
+        reference_cache_id: str,
+        reference_fingerprint: str | None,
+        sequence_length_bucket: int,
+        speaker_context_len_bucket: int,
+        branch_layout: str,
+        scale_signature: ResidentSpeakerKVScaleSignature,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        unscaled_key = self._resident_speaker_kv_key(
+            reference_cache_id=reference_cache_id,
+            reference_fingerprint=reference_fingerprint,
+            sequence_length_bucket=sequence_length_bucket,
+            speaker_context_len_bucket=speaker_context_len_bucket,
+            branch_layout=branch_layout,
+            scale_signature=None,
+        )
+
+        def unscaled_builder() -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+            self._increment_resident_speaker_kv_metric("speaker_kv_projection_calls")
+            with torch.inference_mode():
+                speaker_kv_list = self.model.build_speaker_context_kv_cache(
+                    speaker_state=speaker_state,
+                )
+            return tuple((k, v) for k, v in speaker_kv_list)
+
+        unscaled_payload = self._ensure_resident_speaker_kv_payload(
+            key=unscaled_key,
+            reference_cache_id=reference_cache_id,
+            reference_fingerprint=reference_fingerprint,
+            sequence_length_bucket=sequence_length_bucket,
+            speaker_context_len_bucket=speaker_context_len_bucket,
+            branch_layout=branch_layout,
+            scale_signature=None,
+            builder=unscaled_builder,
+        )
+        if scale_signature is None:
+            return unscaled_payload.speaker_kv_cache
+
+        scaled_key = self._resident_speaker_kv_key(
+            reference_cache_id=reference_cache_id,
+            reference_fingerprint=reference_fingerprint,
+            sequence_length_bucket=sequence_length_bucket,
+            speaker_context_len_bucket=speaker_context_len_bucket,
+            branch_layout=branch_layout,
+            scale_signature=scale_signature,
+        )
+        scale_value, scale_max_layers = scale_signature
+
+        def scaled_builder() -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+            n_layers_total = len(unscaled_payload.speaker_kv_cache)
+            if scale_max_layers is None:
+                n_to_scale = n_layers_total
+            else:
+                n_to_scale = max(0, min(int(scale_max_layers), n_layers_total))
+            scaled_layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for i, (k, v) in enumerate(unscaled_payload.speaker_kv_cache):
+                if i < n_to_scale:
+                    scaled_layers.append((k * float(scale_value), v * float(scale_value)))
+                else:
+                    scaled_layers.append((k, v))
+            return tuple(scaled_layers)
+
+        scaled_payload = self._ensure_resident_speaker_kv_payload(
+            key=scaled_key,
+            reference_cache_id=reference_cache_id,
+            reference_fingerprint=reference_fingerprint,
+            sequence_length_bucket=sequence_length_bucket,
+            speaker_context_len_bucket=speaker_context_len_bucket,
+            branch_layout=branch_layout,
+            scale_signature=scale_signature,
+            builder=scaled_builder,
+        )
+        return scaled_payload.speaker_kv_cache
+
+    def _delete_resident_speaker_kv_for_reference_locked(
+        self,
+        reference_cache_id: str,
+    ) -> int:
+        store = self._resident_speaker_kv_store_dict()
+        to_delete = [
+            key
+            for key, payload in store.items()
+            if payload.reference_cache_id == reference_cache_id
+        ]
+        if not to_delete:
+            return 0
+        metrics = self._resident_speaker_kv_metric_counters()
+        for key in to_delete:
+            store.pop(key, None)
+            metrics["resident_speaker_kv_deletes"] = (
+                int(metrics.get("resident_speaker_kv_deletes", 0)) + 1
+            )
+        return len(to_delete)
+
+    def resident_speaker_kv_metrics_snapshot(self) -> dict[str, object]:
+        with self._runtime_resident_registry_lock():
+            store = dict(self._resident_speaker_kv_store_dict())
+            metrics = dict(self._resident_speaker_kv_metric_counters())
+            max_entries = int(getattr(self, "_resident_speaker_kv_max_entries", 0))
+        entries: list[dict[str, object]] = []
+        for payload in store.values():
+            entries.append(
+                {
+                    "reference_cache_id": payload.reference_cache_id,
+                    "reference_fingerprint": payload.reference_fingerprint,
+                    "sequence_length_bucket": payload.sequence_length_bucket,
+                    "speaker_context_len_bucket": payload.speaker_context_len_bucket,
+                    "branch_layout": payload.branch_layout,
+                    "scale_signature": payload.scale_signature,
+                    "memory_bytes": payload.memory_bytes,
+                    "created_at": payload.created_at.isoformat(),
+                    "last_used_at": payload.last_used_at.isoformat(),
+                }
+            )
+        return {
+            **metrics,
+            "count": len(entries),
+            "memory_bytes": int(sum(int(entry["memory_bytes"]) for entry in entries)),
+            "max_entries": max_entries,
+            "entries": entries,
+        }
+
+    def _infer_mutex(self) -> threading.Lock:
+        lock = getattr(self, "_infer_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._infer_lock = lock
+        return lock
+
+    def _encode_text_conditions(
+        self,
+        *,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        text_encoder = getattr(self.model, "text_encoder", None)
+        text_norm = getattr(self.model, "text_norm", None)
+        if text_encoder is None or text_norm is None:
+            raise CoreMLStatefulUnavailableError(
+                "resident reference fast path requires model text encoder access"
+            )
+        text_state = text_encoder(text_ids, text_mask)
+        text_state = text_norm(text_state)
+        return text_state, text_mask
+
+    def _encode_speaker_conditions(
+        self,
+        *,
+        ref_latent: torch.Tensor | None,
+        ref_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.model_cfg.use_speaker_condition:
+            raise CoreMLStatefulUnavailableError(
+                "speaker-conditioned checkpoints are required by the CoreML stateful fast path"
+            )
+        speaker_encoder = getattr(self.model, "speaker_encoder", None)
+        speaker_norm = getattr(self.model, "speaker_norm", None)
+        prepend_mean = getattr(self.model, "_prepend_masked_mean_token", None)
+        if speaker_encoder is None or speaker_norm is None or prepend_mean is None:
+            raise CoreMLStatefulUnavailableError(
+                "resident reference fast path requires model speaker encoder access"
+            )
+        if ref_latent is None or ref_mask is None:
+            raise ValueError(
+                "ref_latent and ref_mask are required when speaker conditioning is enabled."
+            )
+
+        speaker_patch_size = int(self.model_cfg.speaker_patch_size)
+        speaker_latent, speaker_mask = patch_sequence_with_mask(
+            seq=ref_latent,
+            mask=ref_mask,
+            patch_size=speaker_patch_size,
+        )
+        speaker_state = speaker_encoder(speaker_latent, speaker_mask)
+        speaker_state = speaker_norm(speaker_state)
+        speaker_state, speaker_mask = prepend_mean(speaker_state, speaker_mask)
+        return speaker_state, speaker_mask
+
+    def _find_matching_resident_reference_locked(
+        self,
+        *,
+        reference_cache_id: str,
+        source: str,
+        reference_fingerprint: str | None,
+    ) -> ResidentReferenceTensors | None:
+        registry = self._resident_reference_registry()
+        for existing_id, existing in registry.items():
+            if existing_id == reference_cache_id:
+                continue
+            if existing.source != source:
+                continue
+            if existing.reference_fingerprint != reference_fingerprint:
+                continue
+            return existing
+        return None
+
+    @staticmethod
+    def _resident_reference_matches(
+        resident: ResidentReferenceTensors,
+        *,
+        source: str,
+        reference_fingerprint: str | None,
+    ) -> bool:
+        return resident.source == source and resident.reference_fingerprint == reference_fingerprint
+
+    def prepare_default_reference_tensors(
+        self,
+        ref_wav: str | Path,
+        max_ref_seconds: float | None,
+        *,
+        reference_cache_id: str | None = None,
+        reference_fingerprint: str | None = None,
+        force_refresh: bool = False,
+    ) -> ResidentReferenceTensors:
+        source = str(Path(ref_wav).expanduser().resolve(strict=False))
+        cache_id = str(reference_cache_id or reference_fingerprint or f"server_default:{source}")
+        if cache_id.strip() == "":
+            raise ValueError("reference_cache_id must be non-empty when supplied")
+        prepare_key = ("reference", cache_id)
+        with self._resident_prepare_lock(prepare_key):
+            with self._runtime_resident_registry_lock():
+                registry = self._resident_reference_registry()
+                existing = registry.get(cache_id)
+                now = datetime.now(timezone.utc)
+                if (
+                    existing is not None
+                    and not force_refresh
+                    and self._resident_reference_matches(
+                        existing,
+                        source=source,
+                        reference_fingerprint=reference_fingerprint,
+                    )
+                ):
+                    refreshed = replace(existing, last_used_at=now)
+                    registry[cache_id] = refreshed
+                    return refreshed
+
+                matching = self._find_matching_resident_reference_locked(
+                    reference_cache_id=cache_id,
+                    source=source,
+                    reference_fingerprint=reference_fingerprint,
+                )
+                if matching is not None and not force_refresh:
+                    aliased = replace(
+                        matching,
+                        reference_cache_id=cache_id,
+                        last_used_at=now,
+                    )
+                    if existing is not None:
+                        self._delete_resident_speaker_kv_for_reference_locked(cache_id)
+                    registry[cache_id] = aliased
+                    return aliased
+
+            messages: list[str] = []
+            req = SamplingRequest(
+                text="",
+                ref_wav=source,
+                ref_latent=None,
+                no_ref=False,
+                max_ref_seconds=max_ref_seconds,
+            )
+            with self._infer_mutex(), torch.inference_mode():
+                ref_latent, ref_mask = self._load_reference_latent(
+                    req=req,
+                    batch_size=1,
+                    messages=messages,
+                )
+                self._increment_resident_reference_metric("reference_encode_calls")
+                speaker_state, speaker_mask = self._encode_speaker_conditions(
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                )
+                self._increment_resident_reference_metric("speaker_state_encode_calls")
+
+            if ref_latent is None or ref_mask is None:
+                raise CoreMLStatefulUnavailableError(
+                    "speaker reference latent is required by the CoreML stateful fast path"
+                )
+            now = datetime.now(timezone.utc)
+            resident = ResidentReferenceTensors(
+                reference_cache_id=cache_id,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                speaker_state=speaker_state,
+                speaker_mask=speaker_mask,
+                reference_fingerprint=reference_fingerprint,
+                source=source,
+                ref_len=int(ref_latent.shape[1]),
+                speaker_context_len=int(speaker_mask.shape[1]),
+                speaker_dim=int(speaker_state.shape[-1]),
+                memory_bytes=_tensor_memory_bytes(
+                    ref_latent,
+                    ref_mask,
+                    speaker_state,
+                    speaker_mask,
+                ),
+                device=str(ref_latent.device),
+                dtype=str(ref_latent.dtype),
+                created_at=now,
+                last_used_at=now,
+            )
+            with self._runtime_resident_registry_lock():
+                registry = self._resident_reference_registry()
+                existing = registry.get(cache_id)
+                if (
+                    existing is not None
+                    and not force_refresh
+                    and self._resident_reference_matches(
+                        existing,
+                        source=source,
+                        reference_fingerprint=reference_fingerprint,
+                    )
+                ):
+                    refreshed = replace(existing, last_used_at=datetime.now(timezone.utc))
+                    registry[cache_id] = refreshed
+                    return refreshed
+                if existing is not None:
+                    self._delete_resident_speaker_kv_for_reference_locked(cache_id)
+                registry[cache_id] = resident
+                metrics = self._resident_reference_metric_counters()
+                metrics["resident_reference_prepares"] = (
+                    int(metrics.get("resident_reference_prepares", 0)) + 1
+                )
+            return resident
+
+    def get_resident_reference_tensors(
+        self,
+        reference_cache_id: str,
+    ) -> ResidentReferenceTensors | None:
+        cache_id = str(reference_cache_id)
+        if cache_id.strip() == "":
+            raise ValueError("reference_cache_id must be non-empty")
+        with self._runtime_resident_registry_lock():
+            registry = self._resident_reference_registry()
+            existing = registry.get(cache_id)
+            metrics = self._resident_reference_metric_counters()
+            if existing is None:
+                metrics["resident_reference_misses"] = (
+                    int(metrics.get("resident_reference_misses", 0)) + 1
+                )
+                return None
+            refreshed = replace(existing, last_used_at=datetime.now(timezone.utc))
+            registry[cache_id] = refreshed
+            metrics["resident_reference_hits"] = int(metrics.get("resident_reference_hits", 0)) + 1
+            return refreshed
+
+    def delete_resident_reference_tensors(self, reference_cache_id: str) -> bool:
+        cache_id = str(reference_cache_id)
+        if cache_id.strip() == "":
+            raise ValueError("reference_cache_id must be non-empty")
+        with self._runtime_resident_registry_lock():
+            registry = self._resident_reference_registry()
+            if registry.pop(cache_id, None) is None:
+                return False
+            metrics = self._resident_reference_metric_counters()
+            metrics["resident_reference_deletes"] = (
+                int(metrics.get("resident_reference_deletes", 0)) + 1
+            )
+            self._delete_resident_speaker_kv_for_reference_locked(cache_id)
+            return True
+
+    def resident_reference_metrics_snapshot(self) -> dict[str, object]:
+        with self._runtime_resident_registry_lock():
+            registry = dict(self._resident_reference_registry())
+            metrics = dict(self._resident_reference_metric_counters())
+        entries: list[dict[str, object]] = []
+        for resident in registry.values():
+            entries.append(
+                {
+                    "reference_cache_id": resident.reference_cache_id,
+                    "reference_fingerprint": resident.reference_fingerprint,
+                    "source": resident.source,
+                    "ref_len": resident.ref_len,
+                    "speaker_context_len": resident.speaker_context_len,
+                    "speaker_dim": resident.speaker_dim,
+                    "memory_bytes": resident.memory_bytes,
+                    "device": resident.device,
+                    "dtype": resident.dtype,
+                    "created_at": resident.created_at.isoformat(),
+                    "last_used_at": resident.last_used_at.isoformat(),
+                }
+            )
+        return {
+            **metrics,
+            "count": len(entries),
+            "memory_bytes": int(sum(entry["memory_bytes"] for entry in entries)),
+            "entries": entries,
+        }
+
     def _get_coreml_stateful_backend(
         self,
         *,
@@ -718,6 +1503,7 @@ class InferenceRuntime:
         req: SamplingRequest,
         *,
         condition_cache: ConditionCacheHandle,
+        resident_reference_tensors: ResidentReferenceTensors | None = None,
         log_fn: Callable[[str], None] | None = None,
     ) -> SamplingResult:
         def _log(msg: str) -> None:
@@ -725,6 +1511,17 @@ class InferenceRuntime:
                 log_fn(msg)
 
         self._validate_coreml_stateful_surface(req, condition_cache=condition_cache)
+        if resident_reference_tensors is not None:
+            if resident_reference_tensors.reference_cache_id != condition_cache.reference_cache_id:
+                raise CoreMLStatefulUnavailableError(
+                    "resident reference id conflicts with condition cache reference id"
+                )
+            if int(resident_reference_tensors.speaker_context_len) != int(
+                condition_cache.speaker_context_len
+            ):
+                raise CoreMLStatefulUnavailableError(
+                    "resident reference speaker_context_len conflicts with condition cache"
+                )
         messages: list[str] = []
         _log(
             (
@@ -901,18 +1698,33 @@ class InferenceRuntime:
                     f"{patched_steps} exceeds CoreML condition cache bucket {bucket_steps}"
                 )
 
-            t0 = _measure_start(self.model_device, self.codec_device)
-            msg_count_before_ref = len(messages)
-            ref_latent, ref_mask = self._load_reference_latent(
-                req=req,
-                batch_size=1,
-                messages=messages,
-            )
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("prepare_reference", stage_sec))
-            for msg in messages[msg_count_before_ref:]:
-                _log(msg)
-            _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+            resident_speaker_state = None
+            resident_speaker_mask = None
+            if resident_reference_tensors is None:
+                t0 = _measure_start(self.model_device, self.codec_device)
+                msg_count_before_ref = len(messages)
+                ref_latent, ref_mask = self._load_reference_latent(
+                    req=req,
+                    batch_size=1,
+                    messages=messages,
+                )
+                stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+                stage_timings.append(("prepare_reference", stage_sec))
+                for msg in messages[msg_count_before_ref:]:
+                    _log(msg)
+                _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+            else:
+                t0 = _measure_start(self.model_device)
+                ref_latent = resident_reference_tensors.ref_latent
+                ref_mask = resident_reference_tensors.ref_mask
+                resident_speaker_state = resident_reference_tensors.speaker_state
+                resident_speaker_mask = resident_reference_tensors.speaker_mask
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("prepare_reference_resident", stage_sec))
+                _log(
+                    "[runtime] prepare_reference: resident hit "
+                    f"id={resident_reference_tensors.reference_cache_id}"
+                )
 
             t0 = _measure_start(self.model_device)
             z_patched = self._sample_coreml_stateful_rf_cfg(
@@ -921,6 +1733,8 @@ class InferenceRuntime:
                 text_mask=text_mask,
                 ref_latent=ref_latent,
                 ref_mask=ref_mask,
+                speaker_state=resident_speaker_state,
+                speaker_mask=resident_speaker_mask,
                 sequence_length=bucket_steps,
                 actual_sequence_length=patched_steps,
                 num_steps=int(req.num_steps),
@@ -936,6 +1750,7 @@ class InferenceRuntime:
                 speaker_kv_scale=speaker_kv_scale,
                 speaker_kv_min_t=speaker_kv_min_t,
                 speaker_kv_max_layers=speaker_kv_max_layers,
+                resident_reference_tensors=resident_reference_tensors,
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf_coreml_stateful", stage_sec))
@@ -1041,6 +1856,9 @@ class InferenceRuntime:
         speaker_kv_scale: float | None = None,
         speaker_kv_min_t: float | None = None,
         speaker_kv_max_layers: int | None = None,
+        speaker_state: torch.Tensor | None = None,
+        speaker_mask: torch.Tensor | None = None,
+        resident_reference_tensors: ResidentReferenceTensors | None = None,
     ) -> torch.Tensor:
         device = self.model_device
         dtype = next(self.model.parameters()).dtype
@@ -1061,21 +1879,34 @@ class InferenceRuntime:
         latent_mask[:, : int(actual_sequence_length)] = True
         t_schedule = torch.linspace(1.0, 0.0, int(num_steps) + 1, device=device) * 0.999
 
-        (
-            text_state_cond,
-            text_mask_cond,
-            speaker_state_cond,
-            speaker_mask_cond,
-            caption_state_cond,
-            _caption_mask_cond,
-        ) = self.model.encode_conditions(
-            text_input_ids=text_ids,
-            text_mask=text_mask,
-            ref_latent=ref_latent,
-            ref_mask=ref_mask,
-            caption_input_ids=None,
-            caption_mask=None,
-        )
+        if (speaker_state is None) != (speaker_mask is None):
+            raise CoreMLStatefulUnavailableError(
+                "resident speaker_state and speaker_mask must be supplied together"
+            )
+        if speaker_state is None:
+            (
+                text_state_cond,
+                text_mask_cond,
+                speaker_state_cond,
+                speaker_mask_cond,
+                caption_state_cond,
+                _caption_mask_cond,
+            ) = self.model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=None,
+                caption_mask=None,
+            )
+        else:
+            text_state_cond, text_mask_cond = self._encode_text_conditions(
+                text_ids=text_ids,
+                text_mask=text_mask,
+            )
+            speaker_state_cond = speaker_state.to(device=device, dtype=dtype)
+            speaker_mask_cond = speaker_mask.to(device=device)
+            caption_state_cond = None
         if caption_state_cond is not None:
             raise CoreMLStatefulUnavailableError(
                 "caption state is not supported by the CoreML stateful fast path"
@@ -1091,6 +1922,14 @@ class InferenceRuntime:
             branch_layout=BRANCH_LAYOUT_COND1,
         )
 
+        scale_signature: ResidentSpeakerKVScaleSignature = None
+        if speaker_kv_scale is not None:
+            scale_signature = (
+                float(speaker_kv_scale),
+                None if speaker_kv_max_layers is None else int(speaker_kv_max_layers),
+            )
+        sequence_length_bucket = int(condition_cache.sequence_length)
+
         def _pack_and_prepare(
             *,
             text_state: torch.Tensor,
@@ -1099,17 +1938,39 @@ class InferenceRuntime:
             speaker_mask_val: torch.Tensor,
             apply_speaker_kv_scale: bool,
         ):
-            context_kv = self.model.build_context_kv_cache(
-                text_state=text_state,
-                speaker_state=speaker_state,
-                caption_state=None,
+            use_resident_speaker_kv = (
+                resident_reference_tensors is not None
+                and speaker_state is speaker_state_cond
+                and self.resident_speaker_kv_enabled
             )
-            if apply_speaker_kv_scale and speaker_kv_scale is not None:
-                scale_speaker_kv_cache(
-                    context_kv_cache=context_kv,
-                    scale=float(speaker_kv_scale),
-                    max_layers=speaker_kv_max_layers,
+            if use_resident_speaker_kv:
+                text_kv_cache = self.model.build_text_context_kv_cache(text_state=text_state)
+                speaker_scale_signature = scale_signature if apply_speaker_kv_scale else None
+                speaker_kv_cache = self._get_or_prepare_resident_speaker_kv(
+                    speaker_state=speaker_state_cond,
+                    reference_cache_id=resident_reference_tensors.reference_cache_id,
+                    reference_fingerprint=resident_reference_tensors.reference_fingerprint,
+                    sequence_length_bucket=sequence_length_bucket,
+                    speaker_context_len_bucket=speaker_context_bucket,
+                    branch_layout=BRANCH_LAYOUT_COND1,
+                    scale_signature=speaker_scale_signature,
                 )
+                context_kv = merge_text_and_speaker_context_kv(
+                    text_kv_cache,
+                    speaker_kv_cache,
+                )
+            else:
+                context_kv = self.model.build_context_kv_cache(
+                    text_state=text_state,
+                    speaker_state=speaker_state,
+                    caption_state=None,
+                )
+                if apply_speaker_kv_scale and speaker_kv_scale is not None:
+                    scale_speaker_kv_cache(
+                        context_kv_cache=context_kv,
+                        scale=float(speaker_kv_scale),
+                        max_layers=speaker_kv_max_layers,
+                    )
             payload = pack_context_kv_state(
                 context_kv,
                 text_mask=text_mask_val,
@@ -1657,6 +2518,23 @@ class InferenceRuntime:
         )
 
     def unload(self) -> None:
+        with self._runtime_resident_registry_lock():
+            registry = getattr(self, "_resident_reference_tensors", None)
+            if registry is None:
+                self._resident_reference_tensors = {}
+            else:
+                registry.clear()
+            speaker_kv_store = getattr(self, "_resident_speaker_kv_store", None)
+            if speaker_kv_store is None:
+                self._resident_speaker_kv_store = {}
+            else:
+                speaker_kv_store.clear()
+        with self._coreml_stateful_dict_lock():
+            backends = getattr(self, "_coreml_stateful_backends", None)
+            if backends is None:
+                self._coreml_stateful_backends = {}
+            else:
+                backends.clear()
         del self.model
         del self.tokenizer
         del self.codec
