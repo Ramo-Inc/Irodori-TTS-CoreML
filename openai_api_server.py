@@ -2071,6 +2071,48 @@ def _runtime_split_segment_recursive(
     return refined
 
 
+def _lifespan_warmup_default_condition_cache(
+    *,
+    runtime: Any,
+    settings: ServerSettings,
+    cache_manager: InMemoryCoreMLCacheManager,
+) -> None:
+    text = settings.default_condition_cache_prepare_text
+    if not text:
+        return
+    plan = _build_speech_segment_plan({}, text, settings)
+    if plan.seconds_mode.startswith("auto"):
+        plan = _runtime_refine_segment_plan_for_auto(plan, runtime, settings)
+    bucket_resolutions = _resolve_auto_bucket_resolutions(None, plan.segments, runtime)
+    cache_resolutions = _auto_prepare_speech_caches(
+        irodori=None,
+        runtime=runtime,
+        settings=settings,
+        cache_manager=cache_manager,
+        segments=plan.segments,
+        caption=None,
+        bucket_resolutions=bucket_resolutions,
+    )
+
+    prepared = sum(1 for r in cache_resolutions if r.auto_status == "prepared")
+    reused = sum(1 for r in cache_resolutions if r.auto_status == "reused")
+    miss = sum(1 for r in cache_resolutions if r.condition_handle is None)
+    bucket_ids = [
+        _bucket_header_value(r.bucket) if r.bucket is not None else "none"
+        for r in cache_resolutions
+    ]
+    print(
+        "[lifespan] default condition cache warmup: "
+        f"segments={len(cache_resolutions)} prepared={prepared} "
+        f"reused={reused} miss={miss} buckets={bucket_ids}",
+    )
+    if miss and settings.strict_coreml:
+        raise CoreMLStatefulUnavailableError(
+            f"default condition cache warmup failed for {miss}/{len(cache_resolutions)} "
+            f"segments (buckets={bucket_ids})",
+        )
+
+
 def _runtime_refine_segment_plan_for_auto(
     plan: SpeechSegmentPlan,
     runtime: Any,
@@ -2305,10 +2347,24 @@ def create_app(settings: ServerSettings) -> FastAPI:
                 except Exception as exc:
                     print(f"[lifespan] resident speaker KV warmup skipped: {exc}")
             if settings.default_condition_cache_prepare_text:
-                print(
-                    "[lifespan] default_condition_cache_prepare_text is informational; "
-                    "no condition warmup is performed in this build.",
-                )
+                try:
+                    await asyncio.to_thread(
+                        _lifespan_warmup_default_condition_cache,
+                        runtime=runtime,
+                        settings=settings,
+                        cache_manager=cache_manager,
+                    )
+                except CoreMLStatefulUnavailableError:
+                    if settings.strict_coreml:
+                        raise
+                    print(
+                        "[lifespan] default condition cache warmup unavailable; "
+                        "continuing without prepared caches",
+                    )
+                except Exception as exc:
+                    if settings.strict_coreml:
+                        raise
+                    print(f"[lifespan] default condition cache warmup skipped: {exc}")
         try:
             yield
         finally:

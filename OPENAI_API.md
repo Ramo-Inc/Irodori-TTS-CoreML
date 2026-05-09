@@ -145,6 +145,16 @@ buckets `S=256,T=32,R=160`, `S=512,T=64,R=160`, `S=1024,T=128,R=160`,
 `S=1536,T=192,R=160`, and `S=2048,T=256,R=160` from
 `/Users/ramo/Services/Irodori-TTS`. As a user LaunchAgent, it starts at user login.
 
+The plist also passes `--default-condition-cache-prepare-text` with a short
+Japanese phrase. At startup the server builds a segment plan from this text,
+resolves the AUTO bucket, and prepares the condition / text-encoder cache against
+the default reference. No audio is synthesized; only the text / condition path
+is warmed so the first real short request avoids the one-time initialization
+cost (~20s on first call without warmup). Under `--strict-coreml`, startup
+raises `CoreMLStatefulUnavailableError` if any warmup segment fails to obtain a
+condition handle (e.g., bucket oversize, CoreML unavailable); without
+`--strict-coreml`, the warmup logs a warning and continues.
+
 ```bash
 mkdir -p logs ~/Library/LaunchAgents
 cp launchd/com.ramo.irodori-tts-openai-api.plist ~/Library/LaunchAgents/

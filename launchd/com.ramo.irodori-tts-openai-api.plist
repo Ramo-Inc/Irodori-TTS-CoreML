@@ -25,6 +25,8 @@
     <string>70</string>
     <string>--max-resident-speaker-kv-buckets</string>
     <string>5</string>
+    <string>--default-condition-cache-prepare-text</string>
+    <string>起動時の短い音声合成ウォームアップです。</string>
     <string>--warmup-bucket</string>
     <string>S=256,T=32,R=160</string>
     <string>--warmup-bucket</string>

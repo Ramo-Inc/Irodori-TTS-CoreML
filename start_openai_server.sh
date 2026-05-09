@@ -13,6 +13,7 @@ exec uv run python openai_api_server.py \
   --strict-coreml \
   --max-seconds 70 \
   --max-resident-speaker-kv-buckets 5 \
+  --default-condition-cache-prepare-text "起動時の短い音声合成ウォームアップです。" \
   --warmup-bucket S=256,T=32,R=160 \
   --warmup-bucket S=512,T=64,R=160 \
   --warmup-bucket S=1024,T=128,R=160 \

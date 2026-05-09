@@ -1452,3 +1452,81 @@ def test_runtime_state_get_runtime_applies_resident_speaker_kv_settings(
 
     state.get_runtime()
     assert len(fake_runtime.configure_calls) == 1
+
+
+def test_lifespan_warmup_default_condition_cache_prepares_condition_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = FakeRuntime()
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    warmup_settings = dataclasses.replace(
+        settings,
+        preload=True,
+        default_condition_cache_prepare_text="テスト。",
+    )
+    app = create_app(warmup_settings)
+    with TestClient(app):
+        cache_manager = app.state.coreml_cache_manager
+        snap = cache_manager.metrics_snapshot()
+        assert snap["reference_count"] >= 1
+        assert snap["condition_count"] >= 1
+
+    out = capsys.readouterr().out
+    assert "default condition cache warmup" in out
+    assert "prepared=" in out
+
+
+def test_lifespan_strict_coreml_warmup_raises_when_condition_handle_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+) -> None:
+    runtime = FakeRuntime()
+
+    def get_runtime(self: openai_api_server.RuntimeState) -> FakeRuntime:
+        with self._lock:
+            self._runtime = runtime
+        return runtime
+
+    monkeypatch.setattr(openai_api_server.RuntimeState, "get_runtime", get_runtime)
+
+    def all_oversize(
+        irodori: dict[str, Any] | None,
+        segments: tuple[openai_api_server.SpeechSegment, ...],
+        runtime: Any,
+    ) -> list[openai_api_server.AutoBucketResolution]:
+        del irodori, runtime
+        return [
+            openai_api_server.AutoBucketResolution(
+                bucket=None,
+                reason="oversize_t",
+                attempted=">2048_>256",
+                planning=None,
+            )
+            for _ in segments
+        ]
+
+    monkeypatch.setattr(
+        openai_api_server,
+        "_resolve_auto_bucket_resolutions",
+        all_oversize,
+    )
+
+    warmup_settings = dataclasses.replace(
+        settings,
+        preload=True,
+        strict_coreml=True,
+        default_condition_cache_prepare_text="テスト。",
+    )
+    app = create_app(warmup_settings)
+    with pytest.raises(openai_api_server.CoreMLStatefulUnavailableError):
+        with TestClient(app):
+            pass
