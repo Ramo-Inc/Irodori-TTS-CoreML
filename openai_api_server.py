@@ -2880,7 +2880,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-seconds", type=float, default=4.0)
     parser.add_argument("--max-seconds", type=float, default=70.0)
-    parser.add_argument("--chars-per-second", type=float, default=4.0)
+    parser.add_argument(
+        "--chars-per-second",
+        type=float,
+        default=5.5,
+        help=(
+            "Chars-per-second used to estimate AUTO speech duration and CoreML bucket "
+            "selection. Calibrated for Japanese explanatory speech."
+        ),
+    )
     parser.add_argument("--seconds-padding", type=float, default=1.5)
     parser.add_argument(
         "--max-ref-seconds",

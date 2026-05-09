@@ -31,12 +31,14 @@ server-owned reference file, start with `--reference-wav path/to/reference.wav`.
 
 The server estimates the generation horizon from non-whitespace input length, then clamps
 it between `--min-seconds` and `--max-seconds`. Defaults are tuned for medium-length
-Japanese text: `--min-seconds 4`, `--max-seconds 70`, `--chars-per-second 4`, and
-`--seconds-padding 1.5`. This lets a single AUTO request cover up to about 256
-non-whitespace characters in one CoreML bucket without splitting. Use `--seconds N` to
-force one fixed horizon for all requests, or send extension field `"seconds": N` in one
-request to override only that request. Request-level `seconds` must be between `0.1`
-and `--max-seconds`.
+Japanese text: `--min-seconds 4`, `--max-seconds 70`, `--chars-per-second 5.5`, and
+`--seconds-padding 1.5`. The `chars_per_second=5.5` default is calibrated from measured
+Japanese explanatory speech (~5.37 chars/s); the previous `4.0` overestimated generation
+seconds and pushed segments into unnecessarily large CoreML S buckets. This lets a single
+AUTO request cover up to about 256 non-whitespace characters in one CoreML bucket without
+splitting. Use `--seconds N` to force one fixed horizon for all requests, or send
+extension field `"seconds": N` in one request to override only that request.
+Request-level `seconds` must be between `0.1` and `--max-seconds`.
 
 For AUTO requests, the server selects the smallest CoreML bucket whose
 `(sequence_length, text_len)` covers the request from this preset list:
@@ -140,7 +142,7 @@ caption-conditioned style/control input.
 LaunchAgent autostart:
 
 The project includes [launchd/com.ramo.irodori-tts-openai-api.plist](launchd/com.ramo.irodori-tts-openai-api.plist).
-It runs `/opt/homebrew/bin/uv run python openai_api_server.py --host 0.0.0.0 --port 19841 --model-device mps --codec-device mps --preload --strict-coreml --max-seconds 70 --max-resident-speaker-kv-buckets 5` and warms up
+It runs `/opt/homebrew/bin/uv run python openai_api_server.py --host 0.0.0.0 --port 19841 --model-device mps --codec-device mps --preload --strict-coreml --max-seconds 70 --chars-per-second 5.5 --max-resident-speaker-kv-buckets 5` and warms up
 buckets `S=256,T=32,R=160`, `S=512,T=64,R=160`, `S=1024,T=128,R=160`,
 `S=1536,T=192,R=160`, and `S=2048,T=256,R=160` from
 `/Users/ramo/Services/Irodori-TTS`. As a user LaunchAgent, it starts at user login.

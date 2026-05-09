@@ -47,6 +47,8 @@ def test_cli_defaults_match_server_settings_defaults() -> None:
     assert settings.enable_resident_speaker_kv is True
     assert settings.enable_condition_packed_kv_cache is False
     assert settings.max_seconds == pytest.approx(70.0)
+    assert settings.chars_per_second == pytest.approx(5.5)
+    assert settings.seconds_padding == pytest.approx(1.5)
 
 
 def test_cli_max_seconds_safe_cap_matches_default() -> None:

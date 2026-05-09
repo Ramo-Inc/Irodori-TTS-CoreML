@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import sys
 from collections.abc import Iterator
@@ -791,3 +792,130 @@ def test_runtime_refine_runs_for_auto_seconds_plan(
 
     assert response.status_code == 200
     assert refine_calls == ["auto"]
+
+
+def _service_default_settings(settings: ServerSettings) -> ServerSettings:
+    return dataclasses.replace(
+        settings,
+        chars_per_second=5.5,
+        seconds_padding=1.5,
+        min_seconds=4.0,
+        max_seconds=70.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("char_count", "expected_seconds"),
+    [
+        (135, 26.5),
+        (159, 30.5),
+    ],
+)
+def test_default_chars_per_second_estimates_match_calibration(
+    settings: ServerSettings,
+    char_count: int,
+    expected_seconds: float,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    text = "あ" * char_count
+    estimated = openai_api_server._estimate_generation_seconds(text, default_settings)
+    assert estimated == pytest.approx(expected_seconds)
+
+
+def test_default_chars_per_second_keeps_chunk_below_old_4_0_default(
+    settings: ServerSettings,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    old_settings = dataclasses.replace(default_settings, chars_per_second=4.0)
+    for char_count in (135, 159):
+        text = "あ" * char_count
+        new_seconds = openai_api_server._estimate_generation_seconds(text, default_settings)
+        old_seconds = openai_api_server._estimate_generation_seconds(text, old_settings)
+        assert new_seconds < old_seconds
+
+
+class _StaticBucketRuntime:
+    def __init__(self, *, token_len: int) -> None:
+        self._token_len = int(token_len)
+        self.codec = SimpleNamespace(
+            sample_rate=24_000,
+            model=SimpleNamespace(hop_length=512),
+        )
+        self.model_cfg = SimpleNamespace(
+            latent_patch_size=2,
+            text_tokenizer_repo="fake-tokenizer",
+            text_add_bos=True,
+        )
+        self.tokenizer_fingerprint = "tokenizer:fake"
+
+    def estimate_patched_steps(self, seconds: float) -> int:
+        target_samples = int(float(seconds) * int(self.codec.sample_rate))
+        latent_steps = (target_samples + int(self.codec.model.hop_length) - 1) // int(
+            self.codec.model.hop_length,
+        )
+        return (latent_steps + int(self.model_cfg.latent_patch_size) - 1) // int(
+            self.model_cfg.latent_patch_size,
+        )
+
+    def tokenize_for_bucket(self, normalized_text: str) -> tuple[int, str]:
+        del normalized_text
+        return self._token_len, "sha256:fake-token-ids"
+
+
+def test_default_chars_per_second_avoids_s1536_for_159_char_segment(
+    settings: ServerSettings,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    text = "あ" * 159
+    plan = openai_api_server._build_speech_segment_plan({}, text, default_settings)
+    assert len(plan.segments) == 1
+    segment = plan.segments[0]
+    assert segment.seconds == pytest.approx(30.5)
+
+    runtime = _StaticBucketRuntime(token_len=64)
+    resolution = openai_api_server._resolve_auto_bucket_resolution(None, segment, runtime)
+
+    assert resolution.bucket is not None
+    assert resolution.bucket.sequence_length == 1024
+    assert resolution.bucket.text_len == 128
+
+
+def test_old_4_0_default_would_have_picked_s1536_for_oversize_chunk(
+    settings: ServerSettings,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    old_settings = dataclasses.replace(default_settings, chars_per_second=4.0)
+
+    runtime = _StaticBucketRuntime(token_len=64)
+    text = "あ" * 175
+    new_segment = openai_api_server.SpeechSegment(
+        text=text,
+        seconds=openai_api_server._estimate_generation_seconds(text, default_settings),
+    )
+    old_segment = openai_api_server.SpeechSegment(
+        text=text,
+        seconds=openai_api_server._estimate_generation_seconds(text, old_settings),
+    )
+    new_resolution = openai_api_server._resolve_auto_bucket_resolution(
+        None, new_segment, runtime,
+    )
+    old_resolution = openai_api_server._resolve_auto_bucket_resolution(
+        None, old_segment, runtime,
+    )
+
+    assert new_resolution.bucket is not None
+    assert old_resolution.bucket is not None
+    assert new_resolution.bucket.sequence_length == 1024
+    assert old_resolution.bucket.sequence_length == 1536
+
+
+def test_explicit_request_seconds_unaffected_by_default_chars_per_second(
+    settings: ServerSettings,
+) -> None:
+    default_settings = _service_default_settings(settings)
+    plan = openai_api_server._build_speech_segment_plan(
+        {"seconds": 12.0}, "あ" * 159, default_settings,
+    )
+    assert plan.seconds_mode == "request"
+    assert len(plan.segments) == 1
+    assert plan.segments[0].seconds == pytest.approx(12.0)
