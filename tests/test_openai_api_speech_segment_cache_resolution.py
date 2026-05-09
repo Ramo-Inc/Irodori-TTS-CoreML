@@ -929,12 +929,12 @@ def test_explicit_request_seconds_unaffected_by_default_chars_per_second(
     assert plan.segments[0].seconds == pytest.approx(12.0)
 
 
-def test_default_speed_setting_is_1_2(settings: ServerSettings) -> None:
+def test_default_speed_setting_is_1_0(settings: ServerSettings) -> None:
     default_settings = _service_default_settings(settings)
-    assert default_settings.default_speed == pytest.approx(1.2)
+    assert default_settings.default_speed == pytest.approx(1.0)
 
 
-def test_default_speed_reduces_estimated_seconds_for_auto_plan(
+def test_explicit_speed_above_one_reduces_estimated_seconds_for_auto_plan(
     settings: ServerSettings,
 ) -> None:
     default_settings = _service_default_settings(settings)
@@ -942,12 +942,12 @@ def test_default_speed_reduces_estimated_seconds_for_auto_plan(
     auto_plan = openai_api_server._build_speech_segment_plan(
         {}, text, default_settings,
     )
-    speed_one_plan = openai_api_server._build_speech_segment_plan(
-        {"speed": 1.0}, text, default_settings,
+    fast_plan = openai_api_server._build_speech_segment_plan(
+        {"speed": 1.2}, text, default_settings,
     )
-    assert auto_plan.segments[0].seconds < speed_one_plan.segments[0].seconds
-    assert auto_plan.segments[0].seconds == pytest.approx(26.0)
-    assert speed_one_plan.segments[0].seconds == pytest.approx(30.5)
+    assert fast_plan.segments[0].seconds < auto_plan.segments[0].seconds
+    assert auto_plan.segments[0].seconds == pytest.approx(30.5)
+    assert fast_plan.segments[0].seconds == pytest.approx(26.0)
 
 
 def test_explicit_payload_speed_overrides_default_speed(
@@ -956,10 +956,10 @@ def test_explicit_payload_speed_overrides_default_speed(
     default_settings = _service_default_settings(settings)
     text = "あ" * 159
     plan = openai_api_server._build_speech_segment_plan(
-        {"speed": 1.0}, text, default_settings,
+        {"speed": 1.2}, text, default_settings,
     )
     assert plan.seconds_mode == "auto"
-    assert plan.segments[0].seconds == pytest.approx(30.5)
+    assert plan.segments[0].seconds == pytest.approx(26.0)
 
 
 def test_request_seconds_unaffected_by_default_speed(

@@ -130,7 +130,7 @@ class ServerSettings:
     enable_resident_reference_cache: bool = True
     enable_resident_speaker_kv: bool = True
     enable_condition_packed_kv_cache: bool = False
-    default_speed: float = 1.2
+    default_speed: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -2909,7 +2909,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-precision", choices=["fp32", "bf16"], default="fp32")
     parser.add_argument("--codec-precision", choices=["fp32", "bf16"], default="fp32")
     parser.add_argument("--codec-repo", default=DEFAULT_CODEC_REPO)
-    parser.add_argument("--default-num-steps", type=int, default=40)
+    parser.add_argument("--default-num-steps", type=int, default=30)
     parser.add_argument("--max-num-steps", type=int, default=80)
     parser.add_argument(
         "--seconds",
@@ -2932,11 +2932,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--default-speed",
         type=float,
-        default=1.2,
+        default=1.0,
         help=(
             "Default playback speed multiplier for AUTO duration estimation when the "
             "request omits 'speed'. Scales effective chars-per-second; does not affect "
-            "explicit 'seconds' requests. Range 0.25..4.0."
+            "explicit 'seconds' requests. Range 0.25..4.0. Defaults to 1.0 because "
+            "values >1.0 shorten the AUTO generation horizon and can truncate the end "
+            "of long inputs; clients can opt in per request via the OpenAI 'speed' "
+            "field, and explicit 'seconds' is the safest option for long text."
         ),
     )
     parser.add_argument(

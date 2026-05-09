@@ -49,7 +49,9 @@ def test_cli_defaults_match_server_settings_defaults() -> None:
     assert settings.max_seconds == pytest.approx(70.0)
     assert settings.chars_per_second == pytest.approx(5.5)
     assert settings.seconds_padding == pytest.approx(1.5)
-    assert settings.default_speed == pytest.approx(1.2)
+    assert settings.default_speed == pytest.approx(1.0)
+    assert settings.default_num_steps == 30
+    assert settings.max_num_steps == 80
 
 
 def test_cli_default_speed_accepts_explicit_value() -> None:

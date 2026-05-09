@@ -26,7 +26,9 @@
     <string>--chars-per-second</string>
     <string>5.5</string>
     <string>--default-speed</string>
-    <string>1.2</string>
+    <string>1.0</string>
+    <string>--default-num-steps</string>
+    <string>30</string>
     <string>--max-resident-speaker-kv-buckets</string>
     <string>5</string>
     <string>--default-condition-cache-prepare-text</string>
